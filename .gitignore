@@ -1,0 +1,14 @@
+# APIキー（絶対にGitに含めない）
+.streamlit/secrets.toml
+.gemini_key
+.claude_key
+.anthropic_key
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# macOS
+.DS_Store
