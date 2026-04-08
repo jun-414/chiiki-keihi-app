@@ -152,29 +152,25 @@ def infer_kamoku(vendor: str, text: str = "") -> str:
     return "消耗品"
 
 
-# ===== AI抽出（Gemini / Claude 両対応） =====
+# ===== AI抽出（Gemini Vision / Claude 両対応） =====
 
 # 領収書解析プロンプト（共通）
-_AI_PROMPT_TEMPLATE = """あなたは日本の領収書・レシート解析の専門家です。
-以下のOCRテキストから情報を抽出し、JSON形式のみで返してください（説明文・マークダウン・コードブロック不要）。
+_AI_PROMPT = """あなたは日本の領収書・レシート解析の専門家です。
+この領収書・レシートの画像から情報を抽出し、JSON形式のみで返してください（説明文・マークダウン・コードブロック一切不要）。
 
-OCRテキスト:
-{text}
-
-返答形式（JSONのみ、余計な文字一切不要）:
-{{"vendor": "発行元の店名・会社名", "memo": "購入品目やサービス内容（例: 消耗品購入・ガソリン代・宿泊料、30文字以内）", "date": "YYYY-MM-DD形式または空文字", "amount": 税込合計金額の整数または0}}
+返答形式（JSONのみ）:
+{"vendor": "発行元の店名・会社名", "memo": "購入品目やサービス内容（30文字以内）", "date": "YYYY-MM-DD形式または空文字", "amount": 税込合計金額の整数または0}
 
 抽出ルール:
 - vendor: 領収書を発行した店・企業名（「上様」「様」は含めない）
-- memo: 何を購入・利用したか（品目が複数なら代表的なもの）
-- date: 領収日・購入日（令和も西暦に変換）
-- amount: 税込合計金額の数値（円記号・カンマ不要）"""
+- memo: 何を購入・利用したか（品目が複数なら「消耗品購入」等まとめてOK）
+- date: 領収日・購入日（令和→西暦変換、例: 令和7年3月15日→2025-03-15）
+- amount: 税込合計金額の整数（円記号・カンマ不要、不明なら0）"""
 
 
 def _parse_ai_json(raw: str) -> dict:
     """AI応答からJSONを抽出してパース"""
     raw = re.sub(r'^```[a-z]*\n?|```$', '', raw.strip(), flags=re.MULTILINE).strip()
-    # JSON部分だけ切り出し
     m = re.search(r'\{.*\}', raw, re.DOTALL)
     if m:
         raw = m.group()
@@ -182,18 +178,41 @@ def _parse_ai_json(raw: str) -> dict:
     return _json.loads(raw)
 
 
-def _extract_with_gemini(text: str, api_key: str) -> dict:
+def _extract_with_gemini_vision(img_bytes: bytes, api_key: str) -> dict:
     """
-    Google Gemini APIで抽出（無料枠あり・クレカ不要）
-    キー取得: https://aistudio.google.com/apikey
+    Gemini Vision APIで画像から直接読み取る（OCR不要・最高精度）
+    無料枠: 1日1500回
     """
     import json as _json
     import urllib.request as _req
+    import base64
 
-    prompt = _AI_PROMPT_TEMPLATE.format(text=text[:3000])
+    img_b64 = base64.b64encode(img_bytes).decode()
+    payload = _json.dumps({
+        "contents": [{"parts": [
+            {"text": _AI_PROMPT},
+            {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}},
+        ]}],
+        "generationConfig": {"maxOutputTokens": 512, "temperature": 0.1},
+    }).encode()
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    req = _req.Request(url, data=payload, headers={"content-type": "application/json"})
+    with _req.urlopen(req, timeout=30) as r:
+        result = _json.loads(r.read())
+        raw = result["candidates"][0]["content"]["parts"][0]["text"]
+        return _parse_ai_json(raw)
+
+
+def _extract_with_gemini_text(text: str, api_key: str) -> dict:
+    """Gemini APIでテキストから抽出（画像化できない場合のフォールバック）"""
+    import json as _json
+    import urllib.request as _req
+
+    prompt = _AI_PROMPT.replace("この領収書・レシートの画像から", "以下のOCRテキストから") + f"\n\nOCRテキスト:\n{text[:3000]}"
     payload = _json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": 256, "temperature": 0.1},
+        "generationConfig": {"maxOutputTokens": 512, "temperature": 0.1},
     }).encode()
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
@@ -207,15 +226,14 @@ def _extract_with_gemini(text: str, api_key: str) -> dict:
 def _extract_with_claude(text: str, api_key: str) -> dict:
     """
     Anthropic Claude APIで抽出（有料・高精度）
-    キー取得: https://console.anthropic.com
     """
     import json as _json
     import urllib.request as _req
 
-    prompt = _AI_PROMPT_TEMPLATE.format(text=text[:3000])
+    prompt = _AI_PROMPT.replace("この領収書・レシートの画像から", "以下のOCRテキストから") + f"\n\nOCRテキスト:\n{text[:3000]}"
     payload = _json.dumps({
         "model": "claude-3-5-haiku-20241022",
-        "max_tokens": 256,
+        "max_tokens": 512,
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
 
@@ -234,16 +252,20 @@ def _extract_with_claude(text: str, api_key: str) -> dict:
         return _parse_ai_json(raw)
 
 
-def extract_with_ai(text: str, api_key: str, provider: str = "gemini") -> dict:
+def extract_with_ai(text: str, api_key: str, provider: str = "gemini",
+                    img_bytes: bytes = None) -> dict:
     """
-    AIで領収書テキストから構造化データを抽出。
+    AIで領収書から構造化データを抽出。
+    img_bytes があれば Vision APIで画像を直接解析（最高精度）。
     provider: "gemini"（デフォルト・無料） or "claude"（有料・高精度）
-    Returns: {"vendor": str, "memo": str, "date": str, "amount": int}
     """
     if provider == "claude":
         return _extract_with_claude(text, api_key)
+    elif img_bytes:
+        # Gemini Vision: 画像を直接送信（OCR不要・最高精度）
+        return _extract_with_gemini_vision(img_bytes, api_key)
     else:
-        return _extract_with_gemini(text, api_key)
+        return _extract_with_gemini_text(text, api_key)
 
 
 # ===== テキスト抽出関数 =====
@@ -633,9 +655,12 @@ def extract_from_file(filepath: str, filename: str = None,
     text = ""
     ocr_engine = "なし"
     warning = ""
+    vision_img_bytes = None  # Gemini Visionに渡す画像
 
+    # ===== ファイルを画像化（Gemini Vision / OCR 共用） =====
     if ext == '.pdf':
-        # Step1: テキストPDFとして抽出（pdfplumber）
+        vision_img_bytes = pdf_to_image_bytes(filepath, zoom=2.0)
+        # テキストPDFならpdfplumberでも取得
         try:
             import pdfplumber
             with pdfplumber.open(filepath) as pdf:
@@ -644,42 +669,52 @@ def extract_from_file(filepath: str, filename: str = None,
                     if t:
                         text += t + "\n"
             text = text.strip()
+            if text:
+                ocr_engine = "pdfplumber"
         except Exception:
             pass
-
-        if text:
-            ocr_engine = "pdfplumber"
-        else:
-            # Step2: スキャンPDF → 画像化してOCR
-            img_bytes = pdf_to_image_bytes(filepath, zoom=2.0)
-            if img_bytes:
-                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-                    tmp.write(img_bytes)
-                    tmp_path = tmp.name
-                try:
-                    text, ocr_engine = run_ocr(tmp_path)
-                finally:
-                    os.unlink(tmp_path)
-
     elif ext in ['.jpg', '.jpeg', '.png', '.heic', '.bmp', '.tiff']:
-        # 画像ファイル → JPEG変換してOCR
-        img_bytes = image_to_jpeg_bytes(filepath)
-        if img_bytes:
+        vision_img_bytes = image_to_jpeg_bytes(filepath)
+
+    # ===== Gemini Visionで直接読み取り（APIキーあり・最高精度） =====
+    ai_result = {}
+    if ai_api_key and ai_provider == "gemini" and vision_img_bytes:
+        try:
+            ai_result = extract_with_ai("", ai_api_key, provider="gemini",
+                                        img_bytes=vision_img_bytes)
+            ocr_engine = "Gemini Vision"
+        except Exception:
+            ai_result = {}
+
+    # Gemini Visionが使えなかった場合はOCR→テキストAI or ルールベース
+    if not ai_result:
+        # OCRでテキスト取得（まだ取れていない場合）
+        if not text and vision_img_bytes:
             with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-                tmp.write(img_bytes)
+                tmp.write(vision_img_bytes)
                 tmp_path = tmp.name
             try:
                 text, ocr_engine = run_ocr(tmp_path)
             finally:
                 os.unlink(tmp_path)
 
-    # テキストが取れなかった場合
-    if not text:
+        # Claude or テキストAI
+        if ai_api_key and text:
+            try:
+                ai_result = extract_with_ai(text, ai_api_key, provider=ai_provider)
+                label = "Claude AI" if ai_provider == "claude" else "Gemini AI"
+                ocr_engine += f" + {label}"
+            except Exception:
+                ai_result = {}
+
+    # テキストもAI結果もない場合
+    if not text and not ai_result:
         warning = "テキストを読み取れませんでした（手動で入力してください）"
         return {
             "date": _guess_date_from_filename(filename),
             "vendor": re.sub(r'^[\d_\-]+', '', os.path.splitext(filename)[0]).strip() or filename,
             "amount": 0,
+            "memo": "",
             "tax_rate": "10%",
             "kamoku": "消耗品",
             "jigyo": "ミッション活動",
@@ -687,24 +722,14 @@ def extract_from_file(filepath: str, filename: str = None,
             "_ocr_engine": ocr_engine,
         }
 
-    # ===== AI抽出（APIキーが設定されている場合） =====
-    ai_result = {}
-    if ai_api_key and text:
-        try:
-            ai_result = extract_with_ai(text, ai_api_key, provider=ai_provider)
-            label = "Gemini AI" if ai_provider == "gemini" else "Claude AI"
-            ocr_engine += f" + {label}"
-        except Exception:
-            ai_result = {}  # AI失敗時はルールベースにフォールバック
-
     # 各項目を抽出（AI結果を優先、なければルールベース）
     vendor = str(ai_result.get("vendor", "")).strip() or extract_vendor(text, filename)
     date   = str(ai_result.get("date", "")).strip()   or extract_date(text)
     memo   = str(ai_result.get("memo", "")).strip()   or extract_memo(text, vendor, "")
     kamoku = infer_kamoku(vendor, text)
 
-    # AI抽出の金額（外貨チェックはルールベースで行う）
-    raw_amount, currency = extract_amount_and_currency(text)
+    # 金額: AI結果優先、外貨チェックはルールベース
+    raw_amount, currency = extract_amount_and_currency(text) if text else (0.0, "JPY")
     ai_amount = ai_result.get("amount", 0)
     fx_info = ""
     if currency != "JPY" and raw_amount > 0:
@@ -712,9 +737,9 @@ def extract_from_file(filepath: str, filename: str = None,
         amount = jpy_amount
         fx_info = f"{cur} {raw_amount:.2f} → ¥{jpy_amount:,}（レート: {rate:.2f}円/{cur}）"
     elif ai_amount and int(ai_amount) > 0:
-        amount = int(ai_amount)   # AI抽出金額を使用
+        amount = int(ai_amount)
     else:
-        amount = int(raw_amount)  # ルールベース金額
+        amount = int(raw_amount)
 
     # 警告組み立て
     warns = []
