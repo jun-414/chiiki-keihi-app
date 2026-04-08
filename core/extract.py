@@ -211,7 +211,7 @@ def _extract_with_gemini_vision(img_bytes: bytes, api_key: str) -> dict:
         "generationConfig": {"maxOutputTokens": 512, "temperature": 0.1},
     }).encode()
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
     req = _req.Request(url, data=payload, headers={"content-type": "application/json"})
     with _req.urlopen(req, timeout=30) as r:
         result = _json.loads(r.read())
@@ -230,7 +230,7 @@ def _extract_with_gemini_text(text: str, api_key: str) -> dict:
         "generationConfig": {"maxOutputTokens": 512, "temperature": 0.1},
     }).encode()
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
     req = _req.Request(url, data=payload, headers={"content-type": "application/json"})
     with _req.urlopen(req, timeout=20) as r:
         result = _json.loads(r.read())
