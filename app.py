@@ -392,6 +392,14 @@ elif phase == "review":
                 if record.get("_fx_info"):
                     st.info(f"💱 {record['_fx_info']}")
 
+                # 読み取りエンジン表示（診断用）
+                engine = record.get("_ocr_engine", "")
+                if engine:
+                    color = "🟢" if "Vision" in engine or "AI" in engine else "🟡"
+                    st.caption(f"{color} 読み取り: {engine}")
+                if record.get("_ai_error"):
+                    st.error(f"⚠️ AI読み取りエラー: {record['_ai_error']}")
+
             # 右: 編集フォーム
             with form_col:
                 with st.form(key=f"form_{i}_{filename}"):

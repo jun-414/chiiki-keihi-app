@@ -156,16 +156,31 @@ def infer_kamoku(vendor: str, text: str = "") -> str:
 
 # 領収書解析プロンプト（共通）
 _AI_PROMPT = """あなたは日本の領収書・レシート解析の専門家です。
-この領収書・レシートの画像から情報を抽出し、JSON形式のみで返してください（説明文・マークダウン・コードブロック一切不要）。
+この領収書・レシートから4つの情報を読み取り、必ずJSON形式のみで返してください。
 
-返答形式（JSONのみ）:
-{"vendor": "発行元の店名・会社名", "memo": "購入品目やサービス内容（30文字以内）", "date": "YYYY-MM-DD形式または空文字", "amount": 税込合計金額の整数または0}
+【重要】返答はJSON1行のみ。前置き・説明・マークダウン・コードブロック（```）は一切不要。
 
-抽出ルール:
-- vendor: 領収書を発行した店・企業名（「上様」「様」は含めない）
-- memo: 何を購入・利用したか（品目が複数なら「消耗品購入」等まとめてOK）
-- date: 領収日・購入日（令和→西暦変換、例: 令和7年3月15日→2025-03-15）
-- amount: 税込合計金額の整数（円記号・カンマ不要、不明なら0）"""
+返答例:
+{"vendor": "ホクレン 根室SS", "memo": "ガソリン給油", "date": "2026-03-15", "amount": 8540}
+
+各フィールドの読み取り方:
+- vendor: 領収書・レシートを発行したお店や会社の名前（屋号・店名・会社名）
+  例: "コープさっぽろ", "ENEOS 根室SS", "根室交通株式会社", "Amazon.co.jp"
+  ※ 「上様」「御中」「様」は取引先ではないので含めない
+  ※ 宛名（「〇〇様」）ではなく発行元の名前を読む
+
+- memo: 何を購入・利用したか（品目・サービス内容を簡潔に）
+  例: "ガソリン給油", "事務用品購入", "宿泊料", "バス運賃", "ソフトウェアサブスク"
+  ※ 品目が多い場合は代表的なもの or「消耗品購入」等でまとめる（30文字以内）
+
+- date: 領収日・購入日をYYYY-MM-DD形式で
+  例: 令和7年3月15日 → "2026-03-15"、2026/03/15 → "2026-03-15"
+  ※ 読み取れない場合は空文字 ""
+
+- amount: 税込の合計金額（整数・円記号なし・カンマなし）
+  例: ¥8,540 → 8540、合計 19,650円 → 19650
+  ※ 税抜・小計ではなく「税込合計」「お支払合計」の金額を使う
+  ※ 読み取れない場合は 0"""
 
 
 def _parse_ai_json(raw: str) -> dict:
@@ -678,12 +693,14 @@ def extract_from_file(filepath: str, filename: str = None,
 
     # ===== Gemini Visionで直接読み取り（APIキーあり・最高精度） =====
     ai_result = {}
+    ai_error = ""
     if ai_api_key and ai_provider == "gemini" and vision_img_bytes:
         try:
             ai_result = extract_with_ai("", ai_api_key, provider="gemini",
                                         img_bytes=vision_img_bytes)
             ocr_engine = "Gemini Vision"
-        except Exception:
+        except Exception as e:
+            ai_error = str(e)[:120]
             ai_result = {}
 
     # Gemini Visionが使えなかった場合はOCR→テキストAI or ルールベース
@@ -762,6 +779,7 @@ def extract_from_file(filepath: str, filename: str = None,
         "warning":     warning,
         "_ocr_engine": ocr_engine,
         "_raw_text":   text,
-        "_fx_info":    fx_info,   # 外貨換算情報（ある場合）
+        "_fx_info":    fx_info,
         "_currency":   currency,
+        "_ai_error":   ai_error,  # AIエラー詳細（診断用）
     }
