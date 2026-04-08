@@ -206,20 +206,11 @@ def _gemini_api_call(payload_dict: dict, api_key: str, timeout: int = 30) -> dic
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
     payload = _json.dumps(payload_dict).encode()
 
-    for attempt in range(3):
-        try:
-            req = _req.Request(url, data=payload, headers={"content-type": "application/json"})
-            with _req.urlopen(req, timeout=timeout) as r:
-                result = _json.loads(r.read())
-                raw = result["candidates"][0]["content"]["parts"][0]["text"]
-                return _parse_ai_json(raw)
-        except _err.HTTPError as e:
-            if e.code == 429 and attempt < 2:
-                # レート制限: 待機してリトライ（5秒・10秒）
-                _time.sleep(5 * (attempt + 1))
-                continue
-            raise
-    raise RuntimeError("Gemini API: リトライ上限に達しました（429 Too Many Requests）")
+    req = _req.Request(url, data=payload, headers={"content-type": "application/json"})
+    with _req.urlopen(req, timeout=timeout) as r:
+        result = _json.loads(r.read())
+        raw = result["candidates"][0]["content"]["parts"][0]["text"]
+        return _parse_ai_json(raw)
 
 
 def _extract_with_gemini_vision(img_bytes: bytes, api_key: str) -> dict:
