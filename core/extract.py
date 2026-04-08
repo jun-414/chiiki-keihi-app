@@ -193,49 +193,73 @@ def _parse_ai_json(raw: str) -> dict:
     return _json.loads(raw)
 
 
-def _extract_with_gemini_vision(img_bytes: bytes, api_key: str) -> dict:
+def _gemini_api_call(payload_dict: dict, api_key: str, timeout: int = 30) -> dict:
     """
-    Gemini Vision APIで画像から直接読み取る（OCR不要・最高精度）
-    無料枠: 1日1500回
+    Gemini API共通呼び出し（429レート制限時は自動リトライ）
+    無料枠: 15回/分 → 429が出たら最大3回、間隔を空けてリトライ
     """
     import json as _json
     import urllib.request as _req
+    import urllib.error as _err
+    import time as _time
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    payload = _json.dumps(payload_dict).encode()
+
+    for attempt in range(3):
+        try:
+            req = _req.Request(url, data=payload, headers={"content-type": "application/json"})
+            with _req.urlopen(req, timeout=timeout) as r:
+                result = _json.loads(r.read())
+                raw = result["candidates"][0]["content"]["parts"][0]["text"]
+                return _parse_ai_json(raw)
+        except _err.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                # レート制限: 待機してリトライ（5秒・10秒）
+                _time.sleep(5 * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError("Gemini API: リトライ上限に達しました（429 Too Many Requests）")
+
+
+def _extract_with_gemini_vision(img_bytes: bytes, api_key: str) -> dict:
+    """
+    Gemini Vision APIで画像から直接読み取る（OCR不要・最高精度）
+    無料枠: 1日1500回、1分15回
+    """
     import base64
 
+    # 画像が大きすぎる場合は圧縮（Gemini推奨: 4MB以下）
+    if len(img_bytes) > 3 * 1024 * 1024:
+        try:
+            from PIL import Image as _PIL
+            import io as _io
+            img = _PIL.open(_io.BytesIO(img_bytes))
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=60)
+            img_bytes = buf.getvalue()
+        except Exception:
+            pass
+
     img_b64 = base64.b64encode(img_bytes).decode()
-    payload = _json.dumps({
+    payload = {
         "contents": [{"parts": [
             {"text": _AI_PROMPT},
             {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}},
         ]}],
         "generationConfig": {"maxOutputTokens": 512, "temperature": 0.1},
-    }).encode()
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
-    req = _req.Request(url, data=payload, headers={"content-type": "application/json"})
-    with _req.urlopen(req, timeout=30) as r:
-        result = _json.loads(r.read())
-        raw = result["candidates"][0]["content"]["parts"][0]["text"]
-        return _parse_ai_json(raw)
+    }
+    return _gemini_api_call(payload, api_key, timeout=30)
 
 
 def _extract_with_gemini_text(text: str, api_key: str) -> dict:
     """Gemini APIでテキストから抽出（画像化できない場合のフォールバック）"""
-    import json as _json
-    import urllib.request as _req
-
     prompt = _AI_PROMPT.replace("この領収書・レシートの画像から", "以下のOCRテキストから") + f"\n\nOCRテキスト:\n{text[:3000]}"
-    payload = _json.dumps({
+    payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"maxOutputTokens": 512, "temperature": 0.1},
-    }).encode()
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
-    req = _req.Request(url, data=payload, headers={"content-type": "application/json"})
-    with _req.urlopen(req, timeout=20) as r:
-        result = _json.loads(r.read())
-        raw = result["candidates"][0]["content"]["parts"][0]["text"]
-        return _parse_ai_json(raw)
+    }
+    return _gemini_api_call(payload, api_key, timeout=20)
 
 
 def _extract_with_claude(text: str, api_key: str) -> dict:

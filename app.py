@@ -295,6 +295,10 @@ if phase == "upload":
                     tmp_path = tmp.name
 
                 try:
+                    # 2件目以降はAPI制限対策で少し待つ（無料枠: 15回/分）
+                    if i > 0 and ai_api_key:
+                        import time as _time
+                        _time.sleep(4)
                     data = extract_from_file(tmp_path, filename=f.name,
                                              ai_api_key=ai_api_key, ai_provider=ai_provider)
                     data["jigyo"] = default_jigyo
