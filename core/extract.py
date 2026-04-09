@@ -253,20 +253,12 @@ def _extract_with_gemini_text(text: str, api_key: str) -> dict:
     return _gemini_api_call(payload, api_key, timeout=20)
 
 
-def _extract_with_claude(text: str, api_key: str) -> dict:
-    """
-    Anthropic Claude APIで抽出（有料・高精度）
-    """
+def _claude_api_call(payload_dict: dict, api_key: str, timeout: int = 30) -> dict:
+    """Claude API共通呼び出し"""
     import json as _json
     import urllib.request as _req
 
-    prompt = _AI_PROMPT.replace("この領収書・レシートの画像から", "以下のOCRテキストから") + f"\n\nOCRテキスト:\n{text[:3000]}"
-    payload = _json.dumps({
-        "model": "claude-3-5-haiku-20241022",
-        "max_tokens": 512,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode()
-
+    payload = _json.dumps(payload_dict).encode()
     req = _req.Request(
         "https://api.anthropic.com/v1/messages",
         data=payload,
@@ -276,10 +268,62 @@ def _extract_with_claude(text: str, api_key: str) -> dict:
             "content-type": "application/json",
         }
     )
-    with _req.urlopen(req, timeout=20) as r:
+    with _req.urlopen(req, timeout=timeout) as r:
         result = _json.loads(r.read())
         raw = result["content"][0]["text"]
         return _parse_ai_json(raw)
+
+
+def _extract_with_claude_vision(img_bytes: bytes, api_key: str) -> dict:
+    """
+    Claude Vision APIで画像から直接読み取り（高精度・高速）
+    モデル: claude-3-5-haiku（約0.1〜0.2円/枚）
+    """
+    import base64
+
+    # 画像圧縮（5MB以下推奨）
+    if len(img_bytes) > 4 * 1024 * 1024:
+        try:
+            from PIL import Image as _PIL
+            import io as _io
+            img = _PIL.open(_io.BytesIO(img_bytes))
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=70)
+            img_bytes = buf.getvalue()
+        except Exception:
+            pass
+
+    img_b64 = base64.b64encode(img_bytes).decode()
+    payload = {
+        "model": "claude-3-5-haiku-20241022",
+        "max_tokens": 512,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": img_b64,
+                    }
+                },
+                {"type": "text", "text": _AI_PROMPT}
+            ]
+        }]
+    }
+    return _claude_api_call(payload, api_key, timeout=30)
+
+
+def _extract_with_claude_text(text: str, api_key: str) -> dict:
+    """Claude APIでテキストから抽出（フォールバック）"""
+    prompt = _AI_PROMPT.replace("この領収書・レシートの画像から", "以下のOCRテキストから") + f"\n\nOCRテキスト:\n{text[:3000]}"
+    payload = {
+        "model": "claude-3-5-haiku-20241022",
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    return _claude_api_call(payload, api_key, timeout=20)
 
 
 def extract_with_ai(text: str, api_key: str, provider: str = "gemini",
@@ -287,15 +331,18 @@ def extract_with_ai(text: str, api_key: str, provider: str = "gemini",
     """
     AIで領収書から構造化データを抽出。
     img_bytes があれば Vision APIで画像を直接解析（最高精度）。
-    provider: "gemini"（デフォルト・無料） or "claude"（有料・高精度）
+    provider: "gemini"（無料） or "claude"（高速・高精度）
     """
     if provider == "claude":
-        return _extract_with_claude(text, api_key)
-    elif img_bytes:
-        # Gemini Vision: 画像を直接送信（OCR不要・最高精度）
-        return _extract_with_gemini_vision(img_bytes, api_key)
+        if img_bytes:
+            return _extract_with_claude_vision(img_bytes, api_key)
+        else:
+            return _extract_with_claude_text(text, api_key)
     else:
-        return _extract_with_gemini_text(text, api_key)
+        if img_bytes:
+            return _extract_with_gemini_vision(img_bytes, api_key)
+        else:
+            return _extract_with_gemini_text(text, api_key)
 
 
 # ===== テキスト抽出関数 =====
@@ -706,19 +753,20 @@ def extract_from_file(filepath: str, filename: str = None,
     elif ext in ['.jpg', '.jpeg', '.png', '.heic', '.bmp', '.tiff']:
         vision_img_bytes = image_to_jpeg_bytes(filepath)
 
-    # ===== Gemini Visionで直接読み取り（APIキーあり・最高精度） =====
+    # ===== Vision AIで直接読み取り（APIキーあり・最高精度） =====
     ai_result = {}
     ai_error = ""
-    if ai_api_key and ai_provider == "gemini" and vision_img_bytes:
+    if ai_api_key and vision_img_bytes:
         try:
-            ai_result = extract_with_ai("", ai_api_key, provider="gemini",
+            ai_result = extract_with_ai("", ai_api_key, provider=ai_provider,
                                         img_bytes=vision_img_bytes)
-            ocr_engine = "Gemini Vision"
+            label = "Claude Vision" if ai_provider == "claude" else "Gemini Vision"
+            ocr_engine = label
         except Exception as e:
             ai_error = str(e)[:120]
             ai_result = {}
 
-    # Gemini Visionが使えなかった場合はOCR→テキストAI or ルールベース
+    # Vision AIが使えなかった場合はOCR→テキストAI or ルールベース
     if not ai_result:
         # OCRでテキスト取得（まだ取れていない場合）
         if not text and vision_img_bytes:
@@ -730,13 +778,14 @@ def extract_from_file(filepath: str, filename: str = None,
             finally:
                 os.unlink(tmp_path)
 
-        # Claude or テキストAI
+        # テキストベースAI
         if ai_api_key and text:
             try:
                 ai_result = extract_with_ai(text, ai_api_key, provider=ai_provider)
                 label = "Claude AI" if ai_provider == "claude" else "Gemini AI"
                 ocr_engine += f" + {label}"
-            except Exception:
+            except Exception as e:
+                ai_error = str(e)[:120]
                 ai_result = {}
 
     # テキストもAI結果もない場合

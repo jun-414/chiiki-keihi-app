@@ -140,12 +140,12 @@ with st.sidebar:
 
     _provider = st.radio(
         "AIサービス",
-        ["Gemini（無料）", "Claude（有料・高精度）"],
+        ["Claude（推奨・高速）", "Gemini（無料）"],
         index=0,
         horizontal=True,
-        help="Geminiは無料枠あり（1日1500回）。Claudeは有料だが日本語精度が高い。",
+        help="Claudeは高速・高精度（約0.1〜0.2円/枚）。Geminiは無料枠あり（1日1500回・レート制限あり）。",
     )
-    ai_provider = "gemini" if "Gemini" in _provider else "claude"
+    ai_provider = "claude" if "Claude" in _provider else "gemini"
 
     # ===== APIキーの取得優先順位 =====
     # 1. Streamlit Secrets（クラウド公開時に管理者が設定）
@@ -186,11 +186,11 @@ with st.sidebar:
         st.success(f"✅ AI読み取り: 有効（{_provider} / {_key_source}）")
     else:
         # 手動入力
-        _placeholder = "AIzaSy..." if ai_provider == "gemini" else "sk-ant-..."
+        _placeholder = "sk-ant-..." if ai_provider == "claude" else "AIzaSy..."
         _help_msg = (
-            "aistudio.google.com/apikey で無料取得（Googleアカウントのみ・クレカ不要）"
-            if ai_provider == "gemini"
-            else "console.anthropic.com でキー取得（クレカ登録必要・約0.1〜0.2円/枚）"
+            "console.anthropic.com でキー取得（$5チャージで数百枚分・約0.1〜0.2円/枚）"
+            if ai_provider == "claude"
+            else "aistudio.google.com/apikey で無料取得（Googleアカウントのみ・クレカ不要）"
         )
         _input_key = st.text_input(
             "APIキー",
