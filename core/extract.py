@@ -253,57 +253,11 @@ def _extract_with_gemini_text(text: str, api_key: str) -> dict:
     return _gemini_api_call(payload, api_key, timeout=20)
 
 
-def _get_claude_model(api_key: str) -> str:
-    """
-    Anthropic /v1/models APIで実際に利用可能なモデルを取得し、
-    最も安価なモデル（haiku系）を返す。
-    """
-    import json as _json
-    import urllib.request as _req
-
-    try:
-        req = _req.Request(
-            "https://api.anthropic.com/v1/models?limit=50",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-            }
-        )
-        with _req.urlopen(req, timeout=10) as r:
-            data = _json.loads(r.read())
-        models = [m["id"] for m in data.get("data", [])]
-
-        # haiku（最安価）→ sonnet（中間）→ 何でも の優先順で選ぶ
-        for keyword in ["haiku", "sonnet", "claude"]:
-            matches = [m for m in models if keyword in m.lower()]
-            if matches:
-                # 最新のモデルを選ぶ（文字列ソートで最後のもの）
-                return sorted(matches)[-1]
-    except Exception:
-        pass
-
-    # API失敗時のフォールバック（アカウントで確認済みのモデル）
-    return "claude-sonnet-4-6"
-
-
-# モデル名をキャッシュ（起動後1回だけ検索）
-_cached_claude_model: str = ""
-
-
 def _claude_api_call(payload_dict: dict, api_key: str, timeout: int = 30) -> dict:
-    """Claude API共通呼び出し（モデル名を自動検出してキャッシュ）"""
+    """Claude API共通呼び出し"""
     import json as _json
     import urllib.request as _req
-    import urllib.error as _err
-    global _cached_claude_model
 
-    # モデル名がまだ決まっていなければ自動検出
-    if not _cached_claude_model:
-        _cached_claude_model = _get_claude_model(api_key)
-        if not _cached_claude_model:
-            raise RuntimeError("利用可能なClaudeモデルが見つかりません。APIキーまたはクレジット残高を確認してください。")
-
-    payload_dict["model"] = _cached_claude_model
     payload = _json.dumps(payload_dict).encode()
     req = _req.Request(
         "https://api.anthropic.com/v1/messages",
@@ -319,9 +273,12 @@ def _claude_api_call(payload_dict: dict, api_key: str, timeout: int = 30) -> dic
             result = _json.loads(r.read())
             raw = result["content"][0]["text"]
             return _parse_ai_json(raw)
-    except _err.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")[:200]
-        raise RuntimeError(f"HTTP {e.code}: {body}")
+    except Exception as e:
+        import urllib.error as _err
+        if isinstance(e, _err.HTTPError):
+            body = e.read().decode("utf-8", errors="ignore")[:300]
+            raise RuntimeError(f"HTTP {e.code}: {body}")
+        raise
 
 
 def _extract_with_claude_vision(img_bytes: bytes, api_key: str) -> dict:
@@ -331,28 +288,21 @@ def _extract_with_claude_vision(img_bytes: bytes, api_key: str) -> dict:
     """
     import base64
 
-    # 画像圧縮（Claude推奨: base64で5MB以下 = 元画像3.5MB以下）
-    try:
-        from PIL import Image as _PIL
-        import io as _io
-        img = _PIL.open(_io.BytesIO(img_bytes))
-        # 長辺を最大2000pxに縮小
-        max_size = 2000
-        w, h = img.size
-        if max(w, h) > max_size:
-            scale = max_size / max(w, h)
-            img = img.resize((int(w * scale), int(h * scale)), _PIL.LANCZOS)
-        if img.mode in ('RGBA', 'P', 'LA'):
-            img = img.convert('RGB')
-        buf = _io.BytesIO()
-        img.save(buf, format="JPEG", quality=75, optimize=True)
-        img_bytes = buf.getvalue()
-    except Exception:
-        pass
+    # 画像圧縮（5MB以下推奨）
+    if len(img_bytes) > 4 * 1024 * 1024:
+        try:
+            from PIL import Image as _PIL
+            import io as _io
+            img = _PIL.open(_io.BytesIO(img_bytes))
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=70)
+            img_bytes = buf.getvalue()
+        except Exception:
+            pass
 
     img_b64 = base64.b64encode(img_bytes).decode()
     payload = {
-        "model": _cached_claude_model or "claude-sonnet-4-6",
+        "model": "claude-sonnet-4-6",
         "max_tokens": 512,
         "messages": [{
             "role": "user",
@@ -376,7 +326,7 @@ def _extract_with_claude_text(text: str, api_key: str) -> dict:
     """Claude APIでテキストから抽出（フォールバック）"""
     prompt = _AI_PROMPT.replace("この領収書・レシートの画像から", "以下のOCRテキストから") + f"\n\nOCRテキスト:\n{text[:3000]}"
     payload = {
-        "model": _cached_claude_model or "claude-sonnet-4-6",
+        "model": "claude-sonnet-4-6",
         "max_tokens": 512,
         "messages": [{"role": "user", "content": prompt}],
     }
@@ -810,44 +760,39 @@ def extract_from_file(filepath: str, filename: str = None,
     elif ext in ['.jpg', '.jpeg', '.png', '.heic', '.bmp', '.tiff']:
         vision_img_bytes = image_to_jpeg_bytes(filepath)
 
-    # ===== Step1: OCRでテキスト取得（まだ取れていない場合） =====
+    # ===== Vision AIで直接読み取り（APIキーあり・最高精度） =====
     ai_result = {}
     ai_error = ""
-    if not text and vision_img_bytes:
-        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-            tmp.write(vision_img_bytes)
-            tmp_path = tmp.name
+    if ai_api_key and vision_img_bytes:
         try:
-            text, ocr_engine = run_ocr(tmp_path)
-        finally:
-            os.unlink(tmp_path)
-
-    # ===== Step2: AI高精度解析 =====
-    # Claude: 画像を直接渡してVision API使用（tesseractより高精度）
-    # Gemini: Vision APIで画像を直接解析
-    # テキストのみの場合はテキスト解析にフォールバック
-    if ai_api_key and (text or vision_img_bytes):
-        try:
-            # Claude・Geminiともに画像があれば Vision API 優先
-            img_for_ai = vision_img_bytes if vision_img_bytes else None
-            ai_result = extract_with_ai(text or "", ai_api_key, provider=ai_provider, img_bytes=img_for_ai)
-            label = "Claude Vision" if (ai_provider == "claude" and img_for_ai) else \
-                    "Claude AI" if ai_provider == "claude" else \
-                    "Gemini Vision" if img_for_ai else "Gemini AI"
+            ai_result = extract_with_ai("", ai_api_key, provider=ai_provider,
+                                        img_bytes=vision_img_bytes)
+            label = "Claude Vision" if ai_provider == "claude" else "Gemini Vision"
             ocr_engine = label
         except Exception as e:
-            ai_error = str(e)[:300]
-            # Vision失敗 → テキストのみで再試行
-            if vision_img_bytes and text:
-                try:
-                    ai_result = extract_with_ai(text, ai_api_key, provider=ai_provider, img_bytes=None)
-                    label = "Claude AI" if ai_provider == "claude" else "Gemini AI"
-                    ocr_engine = f"{ocr_engine} + {label}(text fallback)" if ocr_engine else label
-                    ai_error = ""  # 再試行成功
-                except Exception as e2:
-                    ai_error = str(e2)[:300]
-                    ai_result = {}
-            else:
+            ai_error = str(e)[:120]
+            ai_result = {}
+
+    # Vision AIが使えなかった場合はOCR→テキストAI or ルールベース
+    if not ai_result:
+        # OCRでテキスト取得（まだ取れていない場合）
+        if not text and vision_img_bytes:
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                tmp.write(vision_img_bytes)
+                tmp_path = tmp.name
+            try:
+                text, ocr_engine = run_ocr(tmp_path)
+            finally:
+                os.unlink(tmp_path)
+
+        # テキストベースAI
+        if ai_api_key and text:
+            try:
+                ai_result = extract_with_ai(text, ai_api_key, provider=ai_provider)
+                label = "Claude AI" if ai_provider == "claude" else "Gemini AI"
+                ocr_engine += f" + {label}"
+            except Exception as e:
+                ai_error = str(e)[:120]
                 ai_result = {}
 
     # テキストもAI結果もない場合
