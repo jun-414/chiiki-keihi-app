@@ -231,9 +231,31 @@ def write_single_row(ws, row_num: int, data: dict):
     # S列（差引残高）: テンプレートの数式をそのまま使う（74行以内）
 
 
+def _count_existing_image_slots(ws) -> int:
+    """
+    領収書シートに既に貼られている画像スロット数を検出する。
+    A列・G列の "No.X" ラベルを数えて返す。
+    """
+    count = 0
+    LEFT_COL_NUM = 1
+    RIGHT_COL_NUM = 7
+    for row_num in range(1, ws.max_row + 2):
+        for col_num in [LEFT_COL_NUM, RIGHT_COL_NUM]:
+            val = ws.cell(row=row_num, column=col_num).value
+            if isinstance(val, str) and val.strip().startswith("No."):
+                count += 1
+    return count
+
+
 def add_receipt_images_to_sheet(ws, images: list):
     """
-    領収書シートにレシート画像を貼り付ける
+    領収書シートにレシート画像を貼り付ける。
+    既存の画像スロットを検出し、続きから追記する（重複防止）。
+
+    レイアウト:
+      - 2列（左: A列、右: G列）
+      - 各スロット: No.ラベル(1行) + 画像エリア(25行) + 余白(2行) = 28行
+      - 開始行: 2行目から
 
     Args:
         ws: 「領収書　月分」シートのワークシートオブジェクト
@@ -242,38 +264,58 @@ def add_receipt_images_to_sheet(ws, images: list):
     try:
         from openpyxl.drawing.image import Image as XLImage
     except ImportError:
-        return  # openpyxlがない場合はスキップ
+        return
 
-    # 2列レイアウト: 左(A列) と 右(G列)
-    # 各画像エリア: 1行ラベル + 25行画像 + 2行マージン = 28行
-    ROWS_PER_IMAGE = 28
-    LEFT_COL = "A"
-    RIGHT_COL = "G"
+    ROWS_PER_IMAGE = 28   # ラベル1行 + 画像25行 + 余白2行
+    IMG_WIDTH  = 260      # px
+    IMG_HEIGHT = 340      # px
+    START_ROW  = 2
+    LEFT_COL   = "A"
+    RIGHT_COL  = "G"
+    LEFT_COL_NUM  = 1
+    RIGHT_COL_NUM = 7
 
-    for idx, (no, img_bytes) in enumerate(images):
+    # 既存スロット数を取得して続きから配置
+    existing_count = _count_existing_image_slots(ws)
+
+    for i, (no, img_bytes) in enumerate(images):
         if not img_bytes:
             continue
 
-        row_group = idx // 2       # 0, 0, 1, 1, 2, 2...
-        col_side = idx % 2         # 0=左, 1=右
+        slot_idx  = existing_count + i
+        row_group = slot_idx // 2    # 何段目か（0始まり）
+        col_side  = slot_idx % 2     # 0=左, 1=右
 
-        label_row = 2 + row_group * ROWS_PER_IMAGE
-        image_row = label_row + 1
-        col_letter = LEFT_COL if col_side == 0 else RIGHT_COL
-        label_col = 1 if col_side == 0 else 7
+        label_row  = START_ROW + row_group * ROWS_PER_IMAGE
+        image_row  = label_row + 1
+        col_letter = LEFT_COL  if col_side == 0 else RIGHT_COL
+        label_col  = LEFT_COL_NUM if col_side == 0 else RIGHT_COL_NUM
 
         # No.ラベルを書き込む
         ws.cell(row=label_row, column=label_col, value=f"No.{no}")
 
+        # 画像をJPEGに変換（形式問わず安定化）
+        try:
+            from PIL import Image as PILImage
+            import io as _io
+            pil_img = PILImage.open(_io.BytesIO(img_bytes))
+            if pil_img.mode in ('RGBA', 'P', 'LA'):
+                pil_img = pil_img.convert('RGB')
+            buf = _io.BytesIO()
+            pil_img.save(buf, format="JPEG", quality=85)
+            img_bytes = buf.getvalue()
+        except Exception:
+            pass  # 変換失敗時はそのまま使用
+
         # 画像を貼り付け
         try:
             img = XLImage(BytesIO(img_bytes))
-            img.width = 260   # ピクセル
-            img.height = 360  # ピクセル
+            img.width  = IMG_WIDTH
+            img.height = IMG_HEIGHT
             img.anchor = f"{col_letter}{image_row}"
             ws.add_image(img)
         except Exception:
-            pass  # 画像形式が非対応の場合はスキップ
+            pass
 
 
 def sort_records_by_date(records: list) -> list:
