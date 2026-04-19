@@ -808,40 +808,27 @@ def extract_from_file(filepath: str, filename: str = None,
     elif ext in ['.jpg', '.jpeg', '.png', '.heic', '.bmp', '.tiff']:
         vision_img_bytes = image_to_jpeg_bytes(filepath)
 
-    # ===== Vision AIで直接読み取り（APIキーあり・最高精度） =====
+    # ===== Step1: OCRでテキスト取得（まだ取れていない場合） =====
     ai_result = {}
     ai_error = ""
-    if ai_api_key and vision_img_bytes:
+    if not text and vision_img_bytes:
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+            tmp.write(vision_img_bytes)
+            tmp_path = tmp.name
         try:
-            ai_result = extract_with_ai("", ai_api_key, provider=ai_provider,
-                                        img_bytes=vision_img_bytes)
-            label = "Claude Vision" if ai_provider == "claude" else "Gemini Vision"
-            ocr_engine = label
+            text, ocr_engine = run_ocr(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
+    # ===== Step2: OCRテキスト → AIで高精度解析 =====
+    if ai_api_key and text:
+        try:
+            ai_result = extract_with_ai(text, ai_api_key, provider=ai_provider)
+            label = "Claude AI" if ai_provider == "claude" else "Gemini AI"
+            ocr_engine = f"{ocr_engine} + {label}" if ocr_engine else label
         except Exception as e:
-            ai_error = str(e)[:120]
+            ai_error = str(e)[:200]
             ai_result = {}
-
-    # Vision AIが使えなかった場合はOCR→テキストAI or ルールベース
-    if not ai_result:
-        # OCRでテキスト取得（まだ取れていない場合）
-        if not text and vision_img_bytes:
-            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-                tmp.write(vision_img_bytes)
-                tmp_path = tmp.name
-            try:
-                text, ocr_engine = run_ocr(tmp_path)
-            finally:
-                os.unlink(tmp_path)
-
-        # テキストベースAI
-        if ai_api_key and text:
-            try:
-                ai_result = extract_with_ai(text, ai_api_key, provider=ai_provider)
-                label = "Claude AI" if ai_provider == "claude" else "Gemini AI"
-                ocr_engine += f" + {label}"
-            except Exception as e:
-                ai_error = str(e)[:120]
-                ai_result = {}
 
     # テキストもAI結果もない場合
     if not text and not ai_result:
