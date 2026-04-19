@@ -98,10 +98,22 @@ def init_session():
         "denpyo_bytes": None,
         "result_bytes": None,
         "write_results": [],
+        "receipt_sheet_option": "new",   # "new" or 既存シート名
+        "receipt_new_sheet_name": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+
+def get_receipt_sheets(excel_bytes: bytes) -> list:
+    """Excelファイルから「領収書」を含むシート名一覧を返す"""
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(excel_bytes), read_only=True)
+        return [n for n in wb.sheetnames if "領収書" in n]
+    except Exception:
+        return []
 
 
 init_session()
@@ -359,6 +371,46 @@ elif phase == "review":
             st.session_state["phase"] = "writing"
             st.rerun()
 
+    # --- 領収書画像タブ設定 ---
+    with st.expander("📸 領収書画像タブの設定", expanded=False):
+        _denpyo_bytes = st.session_state.get("denpyo_bytes")
+        _receipt_sheets = get_receipt_sheets(_denpyo_bytes) if _denpyo_bytes else []
+
+        _tab_options = ["🆕 新しいタブを作成"]
+        if _receipt_sheets:
+            _tab_options += [f"📋 続きへ追加：{n}" for n in _receipt_sheets]
+
+        _current_opt = st.session_state.get("receipt_sheet_option", "new")
+        # ラジオのデフォルト選択を現在のsession_stateに合わせる
+        _default_idx = 0
+        for _ti, _to in enumerate(_tab_options):
+            if _current_opt != "new" and _current_opt in _to:
+                _default_idx = _ti
+                break
+
+        _tab_sel = st.radio(
+            "画像をどのタブに貼りますか？",
+            _tab_options,
+            index=_default_idx,
+            key="receipt_tab_radio",
+        )
+
+        if _tab_sel.startswith("🆕"):
+            _default_new_name = f"領収書 {month}月分"
+            _new_name = st.text_input(
+                "新しいタブ名",
+                value=st.session_state.get("receipt_new_sheet_name") or _default_new_name,
+                key="receipt_new_name_input",
+            )
+            st.session_state["receipt_sheet_option"]   = "new"
+            st.session_state["receipt_new_sheet_name"] = _new_name or _default_new_name
+            st.caption(f"「{st.session_state['receipt_new_sheet_name']}」という新しいタブを作成します")
+        else:
+            _sel_sheet = _tab_sel.replace("📋 続きへ追加：", "")
+            st.session_state["receipt_sheet_option"]   = _sel_sheet
+            st.session_state["receipt_new_sheet_name"] = ""
+            st.caption(f"「{_sel_sheet}」タブの続きに追記します")
+
     st.divider()
 
     # --- 各領収書のアコーディオン ---
@@ -462,6 +514,8 @@ elif phase == "writing":
                 st.session_state["denpyo_bytes"],
                 write_records,
                 write_imgs,
+                receipt_sheet_option=st.session_state.get("receipt_sheet_option", "new"),
+                new_sheet_name=st.session_state.get("receipt_new_sheet_name", ""),
             )
             st.session_state["result_bytes"]  = updated_bytes
             st.session_state["write_results"] = results

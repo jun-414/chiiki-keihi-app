@@ -329,19 +329,53 @@ def sort_records_by_date(records: list) -> list:
     return sorted(records, key=sort_key)
 
 
+def _get_or_create_receipt_sheet(wb, receipt_sheet_option: str, new_sheet_name: str):
+    """
+    領収書シートを取得または新規作成して返す。
+
+    receipt_sheet_option:
+      "new"       → 新規シート作成（new_sheet_nameを使用）
+      "<シート名>" → 既存のそのシートを使用
+
+    Returns: (worksheet, sheet_name)
+    """
+    if receipt_sheet_option == "new":
+        # 新規シート名を決定（重複時は連番）
+        base_name = new_sheet_name.strip() if new_sheet_name.strip() else "領収書"
+        name = base_name
+        counter = 2
+        while name in wb.sheetnames:
+            name = f"{base_name}({counter})"
+            counter += 1
+        ws = wb.create_sheet(title=name)
+        return ws, name
+    else:
+        # 指定された既存シートを使用
+        if receipt_sheet_option in wb.sheetnames:
+            return wb[receipt_sheet_option], receipt_sheet_option
+        # 見つからない場合は新規作成
+        name = receipt_sheet_option
+        ws = wb.create_sheet(title=name)
+        return ws, name
+
+
 def write_receipts_to_excel(
     excel_bytes: bytes,
     records: list,
     images: list,
+    receipt_sheet_option: str = "auto",
+    new_sheet_name: str = "",
 ) -> tuple:
     """
     複数の経費データを出納簿Excelに書き込み、
     更新済みExcelのbytesと処理結果を返す
 
     Args:
-        excel_bytes: 既存の出納簿Excelファイルのbytes
-        records: 書き込む経費データのリスト
-        images: [(no, img_bytes), ...] 領収書画像リスト
+        excel_bytes:          既存の出納簿Excelファイルのbytes
+        records:              書き込む経費データのリスト
+        images:               [(no, img_bytes), ...] 領収書画像リスト
+        receipt_sheet_option: "new"=新規タブ作成 / "auto"=既存タブ自動検出 / シート名=そのタブに続き書き
+        new_sheet_name:       receipt_sheet_option="new" の時の新しいタブ名
 
     Returns:
         (updated_excel_bytes, results_list)
@@ -395,22 +429,22 @@ def write_receipts_to_excel(
             "row": target_row,
         })
 
-    # 領収書シートへの画像貼り付け
-    receipt_sheet_name = None
-    for name in wb.sheetnames:
-        if "領収書" in name:
-            receipt_sheet_name = name
-            break
+    # ===== 領収書シートへの画像貼り付け =====
+    added_images = [
+        (result["no"], img_bytes)
+        for result, (_, img_bytes) in zip(results, images)
+        if result["status"] == "追加" and result["no"] is not None
+    ]
 
-    if receipt_sheet_name and images:
-        ws_r = wb[receipt_sheet_name]
-        # 追加成功したレコードの画像のみ貼り付け
-        added_images = []
-        for result, (_, img_bytes) in zip(results, images):
-            if result["status"] == "追加" and result["no"] is not None:
-                added_images.append((result["no"], img_bytes))
-        if added_images:
-            add_receipt_images_to_sheet(ws_r, added_images)
+    if added_images:
+        if receipt_sheet_option == "auto":
+            # 後方互換: 最初に見つかった「領収書」シートを使用
+            receipt_sheet_option = next(
+                (n for n in wb.sheetnames if "領収書" in n), "new"
+            )
+
+        ws_r, _ = _get_or_create_receipt_sheet(wb, receipt_sheet_option, new_sheet_name)
+        add_receipt_images_to_sheet(ws_r, added_images)
 
     # BytesIOに保存して返す
     output = BytesIO()
