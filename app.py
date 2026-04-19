@@ -237,8 +237,23 @@ with st.sidebar:
     # ===== 表示: 管理者設定済みなら非表示、未設定なら入力欄を表示 =====
     st.divider()
     if ai_api_key:
-        # キーが設定済み → ユーザーには何も見せない（AI自動有効）
-        pass
+        # キーが設定済み → 管理者向けにテストボタンだけ表示
+        if st.button("🔬 API接続テスト", use_container_width=True):
+            with st.spinner("テスト中..."):
+                try:
+                    import urllib.request as _ur
+                    import json as _jj
+                    # モデル一覧を取得
+                    req = _ur.Request(
+                        "https://api.anthropic.com/v1/models?limit=5",
+                        headers={"x-api-key": ai_api_key, "anthropic-version": "2023-06-01"}
+                    )
+                    with _ur.urlopen(req, timeout=10) as r:
+                        data = _jj.loads(r.read())
+                    models = [m["id"] for m in data.get("data", [])]
+                    st.success(f"✅ 接続OK！利用可能モデル: {', '.join(models[:3])}")
+                except Exception as e:
+                    st.error(f"❌ エラー: {e}")
     else:
         # 未設定 → 入力欄を表示（ローカル開発 or 個人利用向け）
         st.markdown("**🤖 AI読み取り（高精度）**")
