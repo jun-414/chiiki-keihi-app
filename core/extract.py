@@ -268,17 +268,10 @@ def _claude_api_call(payload_dict: dict, api_key: str, timeout: int = 30) -> dic
             "content-type": "application/json",
         }
     )
-    try:
-        with _req.urlopen(req, timeout=timeout) as r:
-            result = _json.loads(r.read())
-            raw = result["content"][0]["text"]
-            return _parse_ai_json(raw)
-    except Exception as e:
-        import urllib.error as _err
-        if isinstance(e, _err.HTTPError):
-            body = e.read().decode("utf-8", errors="ignore")[:300]
-            raise RuntimeError(f"HTTP {e.code}: {body}")
-        raise
+    with _req.urlopen(req, timeout=timeout) as r:
+        result = _json.loads(r.read())
+        raw = result["content"][0]["text"]
+        return _parse_ai_json(raw)
 
 
 def _extract_with_claude_vision(img_bytes: bytes, api_key: str) -> dict:
@@ -302,7 +295,7 @@ def _extract_with_claude_vision(img_bytes: bytes, api_key: str) -> dict:
 
     img_b64 = base64.b64encode(img_bytes).decode()
     payload = {
-        "model": "claude-sonnet-4-6",
+        "model": "claude-haiku-4-5",
         "max_tokens": 512,
         "messages": [{
             "role": "user",
@@ -326,7 +319,7 @@ def _extract_with_claude_text(text: str, api_key: str) -> dict:
     """Claude APIでテキストから抽出（フォールバック）"""
     prompt = _AI_PROMPT.replace("この領収書・レシートの画像から", "以下のOCRテキストから") + f"\n\nOCRテキスト:\n{text[:3000]}"
     payload = {
-        "model": "claude-sonnet-4-6",
+        "model": "claude-haiku-4-5",
         "max_tokens": 512,
         "messages": [{"role": "user", "content": prompt}],
     }

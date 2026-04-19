@@ -29,60 +29,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# =========================================================
-# ログイン認証
-# =========================================================
-def check_login() -> bool:
-    """
-    Streamlit SecretsにLOGIN_IDが設定されている場合のみ認証を要求。
-    ローカル開発時（Secrets未設定）はスキップ。
-    """
-    try:
-        correct_id   = st.secrets.get("LOGIN_ID", "")
-        correct_pass = st.secrets.get("LOGIN_PASS", "")
-    except Exception:
-        correct_id, correct_pass = "", ""
-
-    # Secretsに設定なし → 認証不要（ローカル開発用）
-    if not correct_id:
-        return True
-
-    # 認証済みセッション
-    if st.session_state.get("_authenticated"):
-        return True
-
-    # ===== ログイン画面 =====
-    st.markdown("""
-    <style>
-    .login-box {
-        max-width: 380px; margin: 80px auto; padding: 2.5rem;
-        border-radius: 16px; border: 1px solid #ddd;
-        box-shadow: 0 4px 24px rgba(0,0,0,0.08);
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    col1, col2, col3 = st.columns([1, 1.4, 1])
-    with col2:
-        st.markdown("## 📋 地域おこし協力隊\n### 経費管理システム")
-        st.divider()
-        with st.form("login_form"):
-            input_id   = st.text_input("👤 ユーザーID", placeholder="ID を入力")
-            input_pass = st.text_input("🔒 パスワード", type="password", placeholder="パスワードを入力")
-            submitted  = st.form_submit_button("ログイン", use_container_width=True, type="primary")
-
-        if submitted:
-            if input_id == correct_id and input_pass == correct_pass:
-                st.session_state["_authenticated"] = True
-                st.rerun()
-            else:
-                st.error("IDまたはパスワードが違います")
-
-    return False
-
-if not check_login():
-    st.stop()
-
 st.markdown("""
 <style>
 .block-container { padding-top: 1.5rem; }
@@ -188,100 +134,80 @@ with st.sidebar:
             del st.session_state[k]
         st.rerun()
 
-    # ===== APIキーの取得（優先順位順） =====
-    # 1. Streamlit Secrets → 管理者設定済み（ユーザーには非表示）
-    # 2. 環境変数
-    # 3. ローカルファイル（開発用）
+    # AI設定
+    st.divider()
+    st.markdown("**🤖 AI読み取り（高精度）**")
+
+    _provider = st.radio(
+        "AIサービス",
+        ["Claude（推奨・高速）", "Gemini（無料）"],
+        index=0,
+        horizontal=True,
+        help="Claudeは高速・高精度（約0.1〜0.2円/枚）。Geminiは無料枠あり（1日1500回・レート制限あり）。",
+    )
+    ai_provider = "claude" if "Claude" in _provider else "gemini"
+
+    # ===== APIキーの取得優先順位 =====
+    # 1. Streamlit Secrets（クラウド公開時に管理者が設定）
+    # 2. 環境変数（.envファイルや起動時に設定）
+    # 3. ローカル保存ファイル（過去に入力して保存したもの）
+    # 4. サイドバー手動入力
+    _secret_key_name = "GEMINI_API_KEY" if ai_provider == "gemini" else "ANTHROPIC_API_KEY"
 
     _preset_key = ""
-    ai_provider = "claude"  # デフォルト: Claude
+    _key_source = ""
 
-    # 1. Streamlit Secrets から取得
+    # 1. Streamlit Secrets
     try:
-        _claude_secret = st.secrets.get("ANTHROPIC_API_KEY", "")
-        _gemini_secret = st.secrets.get("GEMINI_API_KEY", "")
-        if _claude_secret:
-            _preset_key = _claude_secret
-            ai_provider = "claude"
-        elif _gemini_secret:
-            _preset_key = _gemini_secret
-            ai_provider = "gemini"
+        _preset_key = st.secrets.get(_secret_key_name, "")
+        if _preset_key:
+            _key_source = "管理者設定済み"
     except Exception:
         pass
 
     # 2. 環境変数
     if not _preset_key:
-        _claude_env = os.environ.get("ANTHROPIC_API_KEY", "")
-        _gemini_env = os.environ.get("GEMINI_API_KEY", "")
-        if _claude_env:
-            _preset_key = _claude_env
-            ai_provider = "claude"
-        elif _gemini_env:
-            _preset_key = _gemini_env
-            ai_provider = "gemini"
+        _preset_key = os.environ.get(_secret_key_name, "")
+        if _preset_key:
+            _key_source = "環境変数"
 
-    # 3. ローカルファイル（開発時のみ）
-    if not _preset_key:
-        for _prov in ["claude", "gemini"]:
-            _key_file = os.path.join(os.path.dirname(__file__), f".{_prov}_key")
-            if os.path.exists(_key_file):
-                with open(_key_file, "r") as _f:
-                    _k = _f.read().strip()
-                if _k:
-                    _preset_key = _k
-                    ai_provider = _prov
-                    break
+    # 3. ローカル保存ファイル
+    _key_file = os.path.join(os.path.dirname(__file__), f".{ai_provider}_key")
+    _saved_key = ""
+    if not _preset_key and os.path.exists(_key_file):
+        with open(_key_file, "r") as _f:
+            _saved_key = _f.read().strip()
+        if _saved_key:
+            _key_source = "保存済み"
 
-    ai_api_key = _preset_key
-
-    # ===== 表示: 管理者設定済みなら非表示、未設定なら入力欄を表示 =====
-    st.divider()
-    if ai_api_key:
-        # キーが設定済み → 管理者向けにテストボタンだけ表示
-        if st.button("🔬 API接続テスト", use_container_width=True):
-            with st.spinner("テスト中..."):
-                try:
-                    import urllib.request as _ur
-                    import json as _jj
-                    # モデル一覧を取得
-                    req = _ur.Request(
-                        "https://api.anthropic.com/v1/models?limit=5",
-                        headers={"x-api-key": ai_api_key, "anthropic-version": "2023-06-01"}
-                    )
-                    with _ur.urlopen(req, timeout=10) as r:
-                        data = _jj.loads(r.read())
-                    models = [m["id"] for m in data.get("data", [])]
-                    st.success(f"✅ 接続OK！利用可能モデル: {', '.join(models[:3])}")
-                except Exception as e:
-                    st.error(f"❌ エラー: {e}")
+    if _preset_key:
+        # 管理者設定or環境変数の場合はキー入力欄を非表示
+        ai_api_key = _preset_key
+        st.success(f"✅ AI読み取り: 有効（{_provider} / {_key_source}）")
     else:
-        # 未設定 → 入力欄を表示（ローカル開発 or 個人利用向け）
-        st.markdown("**🤖 AI読み取り（高精度）**")
-        _provider_choice = st.radio(
-            "AIサービス",
-            ["Claude（推奨・高速）", "Gemini（無料）"],
-            index=0, horizontal=True,
+        # 手動入力
+        _placeholder = "sk-ant-..." if ai_provider == "claude" else "AIzaSy..."
+        _help_msg = (
+            "console.anthropic.com でキー取得（$5チャージで数百枚分・約0.1〜0.2円/枚）"
+            if ai_provider == "claude"
+            else "aistudio.google.com/apikey で無料取得（Googleアカウントのみ・クレカ不要）"
         )
-        ai_provider = "claude" if "Claude" in _provider_choice else "gemini"
-        _key_file = os.path.join(os.path.dirname(__file__), f".{ai_provider}_key")
-        _saved_key = ""
-        if os.path.exists(_key_file):
-            with open(_key_file, "r") as _f:
-                _saved_key = _f.read().strip()
         _input_key = st.text_input(
-            "APIキー", value=_saved_key, type="password",
-            placeholder="sk-ant-..." if ai_provider == "claude" else "AIzaSy...",
+            "APIキー",
+            value=_saved_key,
+            type="password",
+            placeholder=_placeholder,
+            help=_help_msg,
         )
+        # 新しいキーが入力されたら保存
         if _input_key and _input_key != _saved_key:
             with open(_key_file, "w") as _f:
                 _f.write(_input_key)
         ai_api_key = _input_key
-        if ai_api_key:
-            st.success(f"✅ AI読み取り: 有効")
 
         if ai_api_key:
             _icon = "🟢" if ai_provider == "gemini" else "🔵"
-            st.success(f"{_icon} AI読み取り: 有効（{ai_provider}）")
+            st.success(f"{_icon} AI読み取り: 有効（{_provider}）")
         else:
             st.caption("未設定の場合はルールベースで読み取り")
 
