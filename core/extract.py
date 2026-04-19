@@ -282,8 +282,8 @@ def _get_claude_model(api_key: str) -> str:
     except Exception:
         pass
 
-    # API失敗時のフォールバック
-    return "claude-3-haiku-20240307"
+    # API失敗時のフォールバック（アカウントで確認済みのモデル）
+    return "claude-sonnet-4-6"
 
 
 # モデル名をキャッシュ（起動後1回だけ検索）
@@ -300,6 +300,8 @@ def _claude_api_call(payload_dict: dict, api_key: str, timeout: int = 30) -> dic
     # モデル名がまだ決まっていなければ自動検出
     if not _cached_claude_model:
         _cached_claude_model = _get_claude_model(api_key)
+        if not _cached_claude_model:
+            raise RuntimeError("利用可能なClaudeモデルが見つかりません。APIキーまたはクレジット残高を確認してください。")
 
     payload_dict["model"] = _cached_claude_model
     payload = _json.dumps(payload_dict).encode()
@@ -350,7 +352,7 @@ def _extract_with_claude_vision(img_bytes: bytes, api_key: str) -> dict:
 
     img_b64 = base64.b64encode(img_bytes).decode()
     payload = {
-        "model": _cached_claude_model or "claude-3-haiku-20240307",
+        "model": _cached_claude_model or "claude-sonnet-4-6",
         "max_tokens": 512,
         "messages": [{
             "role": "user",
@@ -374,7 +376,7 @@ def _extract_with_claude_text(text: str, api_key: str) -> dict:
     """Claude APIでテキストから抽出（フォールバック）"""
     prompt = _AI_PROMPT.replace("この領収書・レシートの画像から", "以下のOCRテキストから") + f"\n\nOCRテキスト:\n{text[:3000]}"
     payload = {
-        "model": _cached_claude_model or "claude-3-haiku-20240307",
+        "model": _cached_claude_model or "claude-sonnet-4-6",
         "max_tokens": 512,
         "messages": [{"role": "user", "content": prompt}],
     }
@@ -820,15 +822,33 @@ def extract_from_file(filepath: str, filename: str = None,
         finally:
             os.unlink(tmp_path)
 
-    # ===== Step2: OCRテキスト → AIで高精度解析 =====
-    if ai_api_key and text:
+    # ===== Step2: AI高精度解析 =====
+    # Claude: 画像を直接渡してVision API使用（tesseractより高精度）
+    # Gemini: Vision APIで画像を直接解析
+    # テキストのみの場合はテキスト解析にフォールバック
+    if ai_api_key and (text or vision_img_bytes):
         try:
-            ai_result = extract_with_ai(text, ai_api_key, provider=ai_provider)
-            label = "Claude AI" if ai_provider == "claude" else "Gemini AI"
-            ocr_engine = f"{ocr_engine} + {label}" if ocr_engine else label
+            # Claude・Geminiともに画像があれば Vision API 優先
+            img_for_ai = vision_img_bytes if vision_img_bytes else None
+            ai_result = extract_with_ai(text or "", ai_api_key, provider=ai_provider, img_bytes=img_for_ai)
+            label = "Claude Vision" if (ai_provider == "claude" and img_for_ai) else \
+                    "Claude AI" if ai_provider == "claude" else \
+                    "Gemini Vision" if img_for_ai else "Gemini AI"
+            ocr_engine = label
         except Exception as e:
-            ai_error = str(e)[:200]
-            ai_result = {}
+            ai_error = str(e)[:300]
+            # Vision失敗 → テキストのみで再試行
+            if vision_img_bytes and text:
+                try:
+                    ai_result = extract_with_ai(text, ai_api_key, provider=ai_provider, img_bytes=None)
+                    label = "Claude AI" if ai_provider == "claude" else "Gemini AI"
+                    ocr_engine = f"{ocr_engine} + {label}(text fallback)" if ocr_engine else label
+                    ai_error = ""  # 再試行成功
+                except Exception as e2:
+                    ai_error = str(e2)[:300]
+                    ai_result = {}
+            else:
+                ai_result = {}
 
     # テキストもAI結果もない場合
     if not text and not ai_result:

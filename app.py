@@ -281,7 +281,7 @@ with st.sidebar:
 
         if ai_api_key:
             _icon = "🟢" if ai_provider == "gemini" else "🔵"
-            st.success(f"{_icon} AI読み取り: 有効（{_provider}）")
+            st.success(f"{_icon} AI読み取り: 有効（{ai_provider}）")
         else:
             st.caption("未設定の場合はルールベースで読み取り")
 
