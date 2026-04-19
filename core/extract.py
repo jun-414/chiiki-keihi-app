@@ -253,11 +253,66 @@ def _extract_with_gemini_text(text: str, api_key: str) -> dict:
     return _gemini_api_call(payload, api_key, timeout=20)
 
 
-def _claude_api_call(payload_dict: dict, api_key: str, timeout: int = 30) -> dict:
-    """Claude API共通呼び出し"""
+def _get_claude_model(api_key: str) -> str:
+    """
+    利用可能なClaudeモデルを順番に試して返す。
+    候補順: 新しいものから古いものへ。
+    """
     import json as _json
     import urllib.request as _req
+    import urllib.error as _err
 
+    candidates = [
+        "claude-haiku-4-5",
+        "claude-3-5-haiku-20241022",
+        "claude-3-haiku-20240307",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-sonnet-20240229",
+    ]
+    # 簡単なテストリクエストで使えるモデルを特定
+    for model in candidates:
+        try:
+            test_payload = _json.dumps({
+                "model": model,
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "hi"}],
+            }).encode()
+            req = _req.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=test_payload,
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                }
+            )
+            with _req.urlopen(req, timeout=10) as r:
+                r.read()
+            return model  # 成功したモデルを返す
+        except _err.HTTPError as e:
+            if e.code == 404:
+                continue  # このモデルは存在しない → 次へ
+            return model  # 404以外のエラー（認証など）はそのモデルを使う
+        except Exception:
+            continue
+    return candidates[-1]  # 全部ダメなら最後の候補
+
+
+# モデル名をキャッシュ（起動後1回だけ検索）
+_cached_claude_model: str = ""
+
+
+def _claude_api_call(payload_dict: dict, api_key: str, timeout: int = 30) -> dict:
+    """Claude API共通呼び出し（モデル名を自動検出してキャッシュ）"""
+    import json as _json
+    import urllib.request as _req
+    global _cached_claude_model
+
+    # モデル名がまだ決まっていなければ自動検出
+    if not _cached_claude_model:
+        _cached_claude_model = _get_claude_model(api_key)
+
+    payload_dict["model"] = _cached_claude_model
     payload = _json.dumps(payload_dict).encode()
     req = _req.Request(
         "https://api.anthropic.com/v1/messages",
@@ -295,7 +350,7 @@ def _extract_with_claude_vision(img_bytes: bytes, api_key: str) -> dict:
 
     img_b64 = base64.b64encode(img_bytes).decode()
     payload = {
-        "model": "claude-haiku-4-5",
+        "model": _cached_claude_model or "claude-3-haiku-20240307",
         "max_tokens": 512,
         "messages": [{
             "role": "user",
@@ -319,7 +374,7 @@ def _extract_with_claude_text(text: str, api_key: str) -> dict:
     """Claude APIでテキストから抽出（フォールバック）"""
     prompt = _AI_PROMPT.replace("この領収書・レシートの画像から", "以下のOCRテキストから") + f"\n\nOCRテキスト:\n{text[:3000]}"
     payload = {
-        "model": "claude-haiku-4-5",
+        "model": _cached_claude_model or "claude-3-haiku-20240307",
         "max_tokens": 512,
         "messages": [{"role": "user", "content": prompt}],
     }
