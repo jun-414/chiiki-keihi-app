@@ -146,38 +146,24 @@ with st.sidebar:
             del st.session_state[k]
         st.rerun()
 
-    # ===== Secretsにキーがあるか事前確認（表示制御のみに使用） =====
-    _has_secret = False
-    try:
-        _has_secret = bool(
-            st.secrets.get("ANTHROPIC_API_KEY", "") or
-            st.secrets.get("GEMINI_API_KEY", "")
-        )
-    except Exception:
-        _has_secret = False
+    # AI設定
+    st.divider()
+    st.markdown("**🤖 AI読み取り（高精度）**")
 
-    # Secretsになければ → AI設定欄を表示
-    if not _has_secret:
-        st.divider()
-        st.markdown("**🤖 AI読み取り（高精度）**")
-        _provider = st.radio(
-            "AIサービス",
-            ["Claude（推奨・高速）", "Gemini（無料）"],
-            index=0,
-            horizontal=True,
-            help="Claudeは高速・高精度（約0.1〜0.2円/枚）。Geminiは無料枠あり（1日1500回・レート制限あり）。",
-        )
-        ai_provider = "claude" if "Claude" in _provider else "gemini"
-    else:
-        # Secretsにキーあり → 表示なし・変数だけ設定
-        try:
-            ai_provider = "claude" if st.secrets.get("ANTHROPIC_API_KEY", "") else "gemini"
-        except Exception:
-            ai_provider = "claude"
-        _provider = "Claude（推奨・高速）" if ai_provider == "claude" else "Gemini（無料）"
+    _provider = st.radio(
+        "AIサービス",
+        ["Claude（推奨・高速）", "Gemini（無料）"],
+        index=0,
+        horizontal=True,
+        help="Claudeは高速・高精度（約0.1〜0.2円/枚）。Geminiは無料枠あり（1日1500回・レート制限あり）。",
+    )
+    ai_provider = "claude" if "Claude" in _provider else "gemini"
 
-    # ===== APIキーの取得優先順位（ロジックは変更なし） =====
-    # 1. Streamlit Secrets  2. 環境変数  3. ローカル保存ファイル  4. 手動入力
+    # ===== APIキーの取得優先順位 =====
+    # 1. Streamlit Secrets（クラウド公開時に管理者が設定）
+    # 2. 環境変数（.envファイルや起動時に設定）
+    # 3. ローカル保存ファイル（過去に入力して保存したもの）
+    # 4. サイドバー手動入力
     _secret_key_name = "GEMINI_API_KEY" if ai_provider == "gemini" else "ANTHROPIC_API_KEY"
 
     _preset_key = ""
@@ -207,12 +193,11 @@ with st.sidebar:
             _key_source = "保存済み"
 
     if _preset_key:
+        # 管理者設定or環境変数の場合はキー入力欄を非表示
         ai_api_key = _preset_key
-        # 管理者設定済み（Secrets）の場合は表示しない
-        if _key_source != "管理者設定済み":
-            st.success(f"✅ AI読み取り: 有効（{_provider} / {_key_source}）")
+        st.success(f"✅ AI読み取り: 有効（{_provider} / {_key_source}）")
     else:
-        # 4. 手動入力
+        # 手動入力
         _placeholder = "sk-ant-..." if ai_provider == "claude" else "AIzaSy..."
         _help_msg = (
             "console.anthropic.com でキー取得（$5チャージで数百枚分・約0.1〜0.2円/枚）"
@@ -226,6 +211,7 @@ with st.sidebar:
             placeholder=_placeholder,
             help=_help_msg,
         )
+        # 新しいキーが入力されたら保存
         if _input_key and _input_key != _saved_key:
             with open(_key_file, "w") as _f:
                 _f.write(_input_key)
