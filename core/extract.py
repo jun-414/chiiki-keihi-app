@@ -255,47 +255,35 @@ def _extract_with_gemini_text(text: str, api_key: str) -> dict:
 
 def _get_claude_model(api_key: str) -> str:
     """
-    利用可能なClaudeモデルを順番に試して返す。
-    候補順: 新しいものから古いものへ。
+    Anthropic /v1/models APIで実際に利用可能なモデルを取得し、
+    最も安価なモデル（haiku系）を返す。
     """
     import json as _json
     import urllib.request as _req
-    import urllib.error as _err
 
-    candidates = [
-        "claude-haiku-4-5",
-        "claude-3-5-haiku-20241022",
-        "claude-3-haiku-20240307",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-sonnet-20240229",
-    ]
-    # 簡単なテストリクエストで使えるモデルを特定
-    for model in candidates:
-        try:
-            test_payload = _json.dumps({
-                "model": model,
-                "max_tokens": 10,
-                "messages": [{"role": "user", "content": "hi"}],
-            }).encode()
-            req = _req.Request(
-                "https://api.anthropic.com/v1/messages",
-                data=test_payload,
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                }
-            )
-            with _req.urlopen(req, timeout=10) as r:
-                r.read()
-            return model  # 成功したモデルを返す
-        except _err.HTTPError as e:
-            if e.code == 404:
-                continue  # このモデルは存在しない → 次へ
-            return model  # 404以外のエラー（認証など）はそのモデルを使う
-        except Exception:
-            continue
-    return candidates[-1]  # 全部ダメなら最後の候補
+    try:
+        req = _req.Request(
+            "https://api.anthropic.com/v1/models?limit=50",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            }
+        )
+        with _req.urlopen(req, timeout=10) as r:
+            data = _json.loads(r.read())
+        models = [m["id"] for m in data.get("data", [])]
+
+        # haiku（最安価）→ sonnet（中間）→ 何でも の優先順で選ぶ
+        for keyword in ["haiku", "sonnet", "claude"]:
+            matches = [m for m in models if keyword in m.lower()]
+            if matches:
+                # 最新のモデルを選ぶ（文字列ソートで最後のもの）
+                return sorted(matches)[-1]
+    except Exception:
+        pass
+
+    # API失敗時のフォールバック
+    return "claude-3-haiku-20240307"
 
 
 # モデル名をキャッシュ（起動後1回だけ検索）
@@ -306,6 +294,7 @@ def _claude_api_call(payload_dict: dict, api_key: str, timeout: int = 30) -> dic
     """Claude API共通呼び出し（モデル名を自動検出してキャッシュ）"""
     import json as _json
     import urllib.request as _req
+    import urllib.error as _err
     global _cached_claude_model
 
     # モデル名がまだ決まっていなければ自動検出
@@ -323,10 +312,14 @@ def _claude_api_call(payload_dict: dict, api_key: str, timeout: int = 30) -> dic
             "content-type": "application/json",
         }
     )
-    with _req.urlopen(req, timeout=timeout) as r:
-        result = _json.loads(r.read())
-        raw = result["content"][0]["text"]
-        return _parse_ai_json(raw)
+    try:
+        with _req.urlopen(req, timeout=timeout) as r:
+            result = _json.loads(r.read())
+            raw = result["content"][0]["text"]
+            return _parse_ai_json(raw)
+    except _err.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")[:200]
+        raise RuntimeError(f"HTTP {e.code}: {body}")
 
 
 def _extract_with_claude_vision(img_bytes: bytes, api_key: str) -> dict:
@@ -336,17 +329,24 @@ def _extract_with_claude_vision(img_bytes: bytes, api_key: str) -> dict:
     """
     import base64
 
-    # 画像圧縮（5MB以下推奨）
-    if len(img_bytes) > 4 * 1024 * 1024:
-        try:
-            from PIL import Image as _PIL
-            import io as _io
-            img = _PIL.open(_io.BytesIO(img_bytes))
-            buf = _io.BytesIO()
-            img.save(buf, format="JPEG", quality=70)
-            img_bytes = buf.getvalue()
-        except Exception:
-            pass
+    # 画像圧縮（Claude推奨: base64で5MB以下 = 元画像3.5MB以下）
+    try:
+        from PIL import Image as _PIL
+        import io as _io
+        img = _PIL.open(_io.BytesIO(img_bytes))
+        # 長辺を最大2000pxに縮小
+        max_size = 2000
+        w, h = img.size
+        if max(w, h) > max_size:
+            scale = max_size / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), _PIL.LANCZOS)
+        if img.mode in ('RGBA', 'P', 'LA'):
+            img = img.convert('RGB')
+        buf = _io.BytesIO()
+        img.save(buf, format="JPEG", quality=75, optimize=True)
+        img_bytes = buf.getvalue()
+    except Exception:
+        pass
 
     img_b64 = base64.b64encode(img_bytes).decode()
     payload = {
