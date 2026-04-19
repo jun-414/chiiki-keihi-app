@@ -295,7 +295,7 @@ def _extract_with_claude_vision(img_bytes: bytes, api_key: str) -> dict:
 
     img_b64 = base64.b64encode(img_bytes).decode()
     payload = {
-        "model": "claude-3-5-haiku-20241022",
+        "model": "claude-haiku-4-5",
         "max_tokens": 512,
         "messages": [{
             "role": "user",
@@ -319,7 +319,7 @@ def _extract_with_claude_text(text: str, api_key: str) -> dict:
     """Claude APIでテキストから抽出（フォールバック）"""
     prompt = _AI_PROMPT.replace("この領収書・レシートの画像から", "以下のOCRテキストから") + f"\n\nOCRテキスト:\n{text[:3000]}"
     payload = {
-        "model": "claude-3-5-haiku-20241022",
+        "model": "claude-haiku-4-5",
         "max_tokens": 512,
         "messages": [{"role": "user", "content": prompt}],
     }
