@@ -29,6 +29,60 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# =========================================================
+# ログイン認証
+# =========================================================
+def check_login() -> bool:
+    """
+    Streamlit SecretsにLOGIN_IDが設定されている場合のみ認証を要求。
+    ローカル開発時（Secrets未設定）はスキップ。
+    """
+    try:
+        correct_id   = st.secrets.get("LOGIN_ID", "")
+        correct_pass = st.secrets.get("LOGIN_PASS", "")
+    except Exception:
+        correct_id, correct_pass = "", ""
+
+    # Secretsに設定なし → 認証不要（ローカル開発用）
+    if not correct_id:
+        return True
+
+    # 認証済みセッション
+    if st.session_state.get("_authenticated"):
+        return True
+
+    # ===== ログイン画面 =====
+    st.markdown("""
+    <style>
+    .login-box {
+        max-width: 380px; margin: 80px auto; padding: 2.5rem;
+        border-radius: 16px; border: 1px solid #ddd;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.08);
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1, 1.4, 1])
+    with col2:
+        st.markdown("## 📋 地域おこし協力隊\n### 経費管理システム")
+        st.divider()
+        with st.form("login_form"):
+            input_id   = st.text_input("👤 ユーザーID", placeholder="ID を入力")
+            input_pass = st.text_input("🔒 パスワード", type="password", placeholder="パスワードを入力")
+            submitted  = st.form_submit_button("ログイン", use_container_width=True, type="primary")
+
+        if submitted:
+            if input_id == correct_id and input_pass == correct_pass:
+                st.session_state["_authenticated"] = True
+                st.rerun()
+            else:
+                st.error("IDまたはパスワードが違います")
+
+    return False
+
+if not check_login():
+    st.stop()
+
 st.markdown("""
 <style>
 .block-container { padding-top: 1.5rem; }
