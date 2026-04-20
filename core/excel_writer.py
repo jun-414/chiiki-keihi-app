@@ -365,6 +365,7 @@ def write_receipts_to_excel(
     images: list,
     receipt_sheet_option: str = "auto",
     new_sheet_name: str = "",
+    skip_sort: bool = False,
 ) -> tuple:
     """
     複数の経費データを出納簿Excelに書き込み、
@@ -391,10 +392,8 @@ def write_receipts_to_excel(
     ws_d = wb["出納簿"]
     results = []
 
-    # ★ 日付の古い順にソートしてから書き込む
-    sorted_records = sort_records_by_date(records)
-    # imagesはrecordsと対応しているので、ソート後の順序に合わせる
-    # (imagesは別途処理するためrecordsのみソート)
+    # skip_sort=Trueの場合はユーザーが並び替え済みなのでソートしない
+    sorted_records = records if skip_sort else sort_records_by_date(records)
 
     for i, data in enumerate(sorted_records):
         vendor = data.get("vendor", "不明")
