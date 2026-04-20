@@ -318,6 +318,24 @@ def add_receipt_images_to_sheet(ws, images: list):
             pass
 
 
+def clear_data_rows(ws):
+    """
+    出納簿の全データ行のデータ列をクリアする（全書き直しモード用）。
+    クリア対象: C(3) E(5) G(7) I(9) J(10) K(11) P(16) Q(17) R(18)
+    保持する列: A(No.) B(令和) D(年) F(月) H(日) S(残高数式)
+    """
+    _, totals_row = detect_data_range(ws)
+    scan_end = (totals_row - 1) if totals_row else (DATA_START_ROW + 500)
+
+    clear_cols = [3, 5, 7, 9, 10, 11, 16, 17, 18]
+
+    for row_num in range(DATA_START_ROW, scan_end + 1):
+        a_val = ws.cell(row=row_num, column=1).value
+        if isinstance(a_val, (int, float)) and a_val > 0:
+            for col in clear_cols:
+                ws.cell(row=row_num, column=col).value = None
+
+
 def sort_records_by_date(records: list) -> list:
     """
     records を日付の古い順にソートして返す
@@ -366,6 +384,7 @@ def write_receipts_to_excel(
     receipt_sheet_option: str = "auto",
     new_sheet_name: str = "",
     skip_sort: bool = False,
+    rewrite_all: bool = False,
 ) -> tuple:
     """
     複数の経費データを出納簿Excelに書き込み、
@@ -374,9 +393,12 @@ def write_receipts_to_excel(
     Args:
         excel_bytes:          既存の出納簿Excelファイルのbytes
         records:              書き込む経費データのリスト
-        images:               [(no, img_bytes), ...] 領収書画像リスト
+                              rewrite_all=True の場合、_type="existing"|"new" フィールドを含む
+        images:               [(no, img_bytes), ...] 領収書画像リスト（新規アイテム分のみ）
         receipt_sheet_option: "new"=新規タブ作成 / "auto"=既存タブ自動検出 / シート名=そのタブに続き書き
         new_sheet_name:       receipt_sheet_option="new" の時の新しいタブ名
+        skip_sort:            True=日付ソートをスキップ（ユーザー指定順を維持）
+        rewrite_all:          True=既存データをクリアしてから全件書き直し（重複チェックなし）
 
     Returns:
         (updated_excel_bytes, results_list)
@@ -391,50 +413,87 @@ def write_receipts_to_excel(
 
     ws_d = wb["出納簿"]
     results = []
+    added_images = []
 
-    # skip_sort=Trueの場合はユーザーが並び替え済みなのでソートしない
-    sorted_records = records if skip_sort else sort_records_by_date(records)
+    if rewrite_all:
+        # ===== 全書き直しモード =====
+        # 1. 全データ行をクリア
+        clear_data_rows(ws_d)
 
-    for i, data in enumerate(sorted_records):
-        vendor = data.get("vendor", "不明")
-        amount = data.get("amount", 0)
-        date_str = data.get("date", "")
+        # 2. 新規アイテムの画像イテレータ
+        img_iter = iter(images)
 
-        # 重複チェック
-        if is_duplicate(ws_d, date_str, vendor, amount):
+        # 3. 全件を指定順で書き込む（重複チェックなし）
+        for data in records:
+            vendor = data.get("vendor", "不明")
+            amount = data.get("amount", 0)
+
+            target_row = find_first_empty_row(ws_d)
+            write_single_row(ws_d, target_row, data)
+            no = ws_d.cell(row=target_row, column=1).value
+
             results.append({
-                "no": None,
+                "no": no,
                 "vendor": vendor,
                 "amount": amount,
-                "status": "重複スキップ",
-                "row": None,
+                "status": "追加",
+                "row": target_row,
             })
-            continue
 
-        # 書き込み先の空行を探す（74行超えた場合も自動追記）
-        target_row = find_first_empty_row(ws_d)
+            # 新規アイテムのみ画像を対応付け（_type="new"）
+            if data.get("_type") == "new":
+                try:
+                    _, img_bytes = next(img_iter)
+                    if img_bytes:
+                        added_images.append((no, img_bytes))
+                except StopIteration:
+                    pass
 
-        # 書き込み実行
-        write_single_row(ws_d, target_row, data)
+    else:
+        # ===== 通常モード（新規追加・重複チェックあり）=====
+        sorted_records = records if skip_sort else sort_records_by_date(records)
 
-        # この行の№を取得（A列）
-        no = ws_d.cell(row=target_row, column=1).value
+        for data in sorted_records:
+            vendor = data.get("vendor", "不明")
+            amount = data.get("amount", 0)
+            date_str = data.get("date", "")
 
-        results.append({
-            "no": no,
-            "vendor": vendor,
-            "amount": amount,
-            "status": "追加",
-            "row": target_row,
-        })
+            # 重複チェック
+            if is_duplicate(ws_d, date_str, vendor, amount):
+                results.append({
+                    "no": None,
+                    "vendor": vendor,
+                    "amount": amount,
+                    "status": "重複スキップ",
+                    "row": None,
+                })
+                continue
+
+            # 書き込み先の空行を探す（74行超えた場合も自動追記）
+            target_row = find_first_empty_row(ws_d)
+
+            # 書き込み実行
+            write_single_row(ws_d, target_row, data)
+
+            # この行の№を取得（A列）
+            no = ws_d.cell(row=target_row, column=1).value
+
+            results.append({
+                "no": no,
+                "vendor": vendor,
+                "amount": amount,
+                "status": "追加",
+                "row": target_row,
+            })
+
+        # 通常モードの画像対応: results と images は同順・同数
+        added_images = [
+            (result["no"], img_bytes)
+            for result, (_, img_bytes) in zip(results, images)
+            if result["status"] == "追加" and result["no"] is not None
+        ]
 
     # ===== 領収書シートへの画像貼り付け =====
-    added_images = [
-        (result["no"], img_bytes)
-        for result, (_, img_bytes) in zip(results, images)
-        if result["status"] == "追加" and result["no"] is not None
-    ]
-
     if added_images:
         if receipt_sheet_option == "auto":
             # 後方互換: 最初に見つかった「領収書」シートを使用

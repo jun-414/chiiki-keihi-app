@@ -117,7 +117,10 @@ def get_receipt_sheets(excel_bytes: bytes) -> list:
 
 
 def read_existing_rows(excel_bytes: bytes) -> list:
-    """出納簿シートから既存データを読み取りリストで返す"""
+    """
+    出納簿シートから既存データを読み取り、write_single_row互換形式で返す。
+    重い処理なので呼び出し元でsession_stateにキャッシュすること。
+    """
     rows = []
     try:
         import openpyxl
@@ -134,23 +137,24 @@ def read_existing_rows(excel_bytes: bytes) -> list:
                 continue
             if not isinstance(a, (int, float)):
                 continue
-            c = ws.cell(row=row_num, column=3).value   # 令和年
-            e = ws.cell(row=row_num, column=5).value   # 月
-            g = ws.cell(row=row_num, column=7).value   # 日
-            k = ws.cell(row=row_num, column=11).value  # 摘要
-            j = ws.cell(row=row_num, column=10).value  # 勘定科目
+            c  = ws.cell(row=row_num, column=3).value   # 令和年
+            e  = ws.cell(row=row_num, column=5).value   # 月
+            g  = ws.cell(row=row_num, column=7).value   # 日
+            k  = ws.cell(row=row_num, column=11).value  # 摘要
+            j  = ws.cell(row=row_num, column=10).value  # 勘定科目
+            ii = ws.cell(row=row_num, column=9).value   # 事業名
             try:
                 date_str = f"{int(c)+2018}-{int(e):02d}-{int(g):02d}" if c and e and g else ""
             except Exception:
                 date_str = ""
             rows.append({
-                "No.":   int(a),
-                "日付":   date_str,
-                "取引先": str(p or ""),
-                "摘要":   str(k or ""),
-                "金額":   f"¥{int(r or q or 0):,}",
-                "勘定科目": str(j or ""),
-                "_existing": True,
+                "_type":  "existing",
+                "date":   date_str,
+                "vendor": str(p or ""),
+                "memo":   str(k or ""),
+                "amount": int(r or q or 0),
+                "kamoku": str(j or "消耗品"),
+                "jigyo":  str(ii or "ミッション活動"),
             })
     except Exception:
         pass
@@ -409,14 +413,26 @@ elif phase == "review":
         if st.button(f"📋 {confirmed_count}件の順番を確認する",
                      type="primary", use_container_width=True,
                      disabled=write_disabled):
-            # 確認済みレコードに元のインデックスを付けて保存
-            all_records   = st.session_state["records"]
-            all_ex_images = st.session_state["excel_images"]
-            st.session_state["order_records"] = [
-                {**r, "_orig_idx": j}
+            all_records = st.session_state["records"]
+
+            # 新規レコード（確認済み）に _type と _orig_idx を付与
+            new_items = [
+                {**r, "_type": "new", "_orig_idx": j}
                 for j, r in enumerate(all_records)
                 if r.get("_confirmed")
             ]
+
+            # 既存データを1回だけ読み込んでキャッシュ（重い処理）
+            with st.spinner("既存データを読み込み中..."):
+                existing_items = read_existing_rows(
+                    st.session_state.get("denpyo_bytes", b"")
+                )
+
+            # 既存データ（前）＋新規データ（後）の合成リスト
+            all_order_items = existing_items + new_items
+
+            st.session_state["all_order_items"] = all_order_items
+            st.session_state["order_records"]   = new_items  # 後方互換用
             st.session_state["phase"] = "order"
             st.rerun()
 
@@ -547,15 +563,22 @@ elif phase == "review":
 
 
 # =========================================================
-# フェーズ2.5: 順番確認・並び替え
+# フェーズ2.5: 順番確認・並び替え（既存＋新規を一覧で並び替え）
 # =========================================================
 elif phase == "order":
-    order_records = st.session_state.get("order_records", [])
+    # all_order_items: 既存データ(_type="existing") + 新規データ(_type="new") の合成リスト
+    all_order_items = st.session_state.get("all_order_items", [])
+
+    ex_count  = sum(1 for r in all_order_items if r.get("_type") == "existing")
+    new_count = sum(1 for r in all_order_items if r.get("_type") == "new")
 
     # --- ヘッダー ---
     oc1, oc2, oc3 = st.columns([3, 1, 1])
     with oc1:
-        st.markdown(f"### 📋 書き込み順番の確認・調整　（{len(order_records)}件）")
+        st.markdown(
+            f"### 📋 書き込み順番の確認・調整　"
+            f"（既存: {ex_count}件 / 新規: {new_count}件）"
+        )
     with oc2:
         if st.button("← 戻って編集", use_container_width=True):
             st.session_state["phase"] = "review"
@@ -567,65 +590,49 @@ elif phase == "order":
 
     st.divider()
 
-    # --- 既存データの表示 ---
-    existing_rows = read_existing_rows(st.session_state.get("denpyo_bytes", b""))
-    if existing_rows:
-        st.markdown("**📂 既存データ（変更不可）**")
-        df_existing = pd.DataFrame([
-            {
-                "No.": r["No."],
-                "日付": r["日付"],
-                "取引先": r["取引先"],
-                "摘要": r["摘要"],
-                "金額": r["金額"],
-                "勘定科目": r["勘定科目"],
-            }
-            for r in existing_rows
-        ])
-        st.dataframe(df_existing, use_container_width=True, hide_index=True)
-        st.caption(f"↑ 既存 {len(existing_rows)} 件（Excelに書き込み済み）")
+    if not all_order_items:
+        st.warning("書き込むデータがありません")
     else:
-        st.info("既存データなし（新規ファイル）")
-
-    st.divider()
-
-    # --- 追加予定レコードの並び替え ---
-    st.markdown("**🆕 新しく追加する順番（↑↓ で入れ替え）**")
-    st.caption("日付・取引先・金額を確認して、順番を調整できます")
-
-    next_no = (existing_rows[-1]["No."] + 1) if existing_rows else 1
-
-    for i, rec in enumerate(order_records):
-        row_no   = next_no + i
-        date_str = rec.get("date", "")
-        vendor   = rec.get("vendor", "不明")
-        memo     = rec.get("memo", "")
-        amount   = int(rec.get("amount", 0))
-        kamoku   = rec.get("kamoku", "")
-
-        col_info, col_up, col_down = st.columns([10, 1, 1])
-        with col_info:
-            st.markdown(
-                f"**No.{row_no}**　{date_str}　{vendor}　*{memo}*　**¥{amount:,}**　`{kamoku}`"
+        if ex_count > 0:
+            st.info(
+                "📂 既存データも含めて並び替えできます。"
+                "「✅ この順番で書き込む」を押すと、既存データをクリアして全件を指定順で書き直します。"
             )
-        with col_up:
-            up_disabled = (i == 0)
-            if st.button("↑", key=f"up_{i}", disabled=up_disabled):
-                order_records[i], order_records[i-1] = order_records[i-1], order_records[i]
-                st.session_state["order_records"] = order_records
-                st.rerun()
-        with col_down:
-            down_disabled = (i == len(order_records) - 1)
-            if st.button("↓", key=f"down_{i}", disabled=down_disabled):
-                order_records[i], order_records[i+1] = order_records[i+1], order_records[i]
-                st.session_state["order_records"] = order_records
-                st.rerun()
+        st.caption("💡 ↑↓ ボタンで順番を入れ替えられます　📂 = 既存データ　🆕 = 新規追加")
 
-        if i < len(order_records) - 1:
-            st.divider()
+        for i, rec in enumerate(all_order_items):
+            is_existing = rec.get("_type") == "existing"
+            tag      = "📂 既存" if is_existing else "🆕 新規"
+            date_str = rec.get("date", "")
+            vendor   = rec.get("vendor", "不明")
+            memo     = rec.get("memo", "")
+            amount   = int(rec.get("amount", 0))
+            kamoku   = rec.get("kamoku", "")
+
+            col_info, col_up, col_down = st.columns([10, 1, 1])
+            with col_info:
+                st.markdown(
+                    f"**No.{i+1}**　{tag}　{date_str}　{vendor}　"
+                    f"*{memo}*　**¥{amount:,}**　`{kamoku}`"
+                )
+            with col_up:
+                if st.button("↑", key=f"up_{i}", disabled=(i == 0)):
+                    all_order_items[i], all_order_items[i-1] = \
+                        all_order_items[i-1], all_order_items[i]
+                    st.session_state["all_order_items"] = all_order_items
+                    st.rerun()
+            with col_down:
+                if st.button("↓", key=f"down_{i}",
+                             disabled=(i == len(all_order_items) - 1)):
+                    all_order_items[i], all_order_items[i+1] = \
+                        all_order_items[i+1], all_order_items[i]
+                    st.session_state["all_order_items"] = all_order_items
+                    st.rerun()
+
+            if i < len(all_order_items) - 1:
+                st.divider()
 
     st.divider()
-    # 下にも確定ボタン
     if st.button("✅ この順番でExcelに書き込む", type="primary", use_container_width=True):
         st.session_state["phase"] = "writing"
         st.rerun()
@@ -635,27 +642,48 @@ elif phase == "order":
 # フェーズ3: 書き込み処理（非表示で実行）
 # =========================================================
 elif phase == "writing":
-    records      = st.session_state["records"]
     excel_images = st.session_state["excel_images"]
 
     with st.spinner("出納簿に書き込み中..."):
-        # order_records がある場合はその順番を使う（ない場合は従来通り）
-        order_records = st.session_state.get("order_records")
-        excel_images  = st.session_state["excel_images"]
+        all_order_items = st.session_state.get("all_order_items")
 
-        if order_records:
-            # 並び替え済みリストを使用（_orig_idxで元の画像と対応）
-            write_records = [{k: v for k, v in r.items() if k != "_orig_idx"}
-                             for r in order_records]
-            write_imgs    = [(i + 1, excel_images[r["_orig_idx"]])
-                             for i, r in enumerate(order_records)]
+        if all_order_items:
+            # 既存データが含まれているか確認 → 含まれる場合は全書き直しモード
+            has_existing = any(r.get("_type") == "existing" for r in all_order_items)
+            rewrite_all  = has_existing
+
+            # 書き込み用レコード（内部管理フィールドの一部を除去、_typeは残す）
+            _drop_keys = {"_confirmed", "_ocr_engine", "_ai_error", "_fx_info",
+                          "warning", "_orig_idx"}
+            write_records = [
+                {k: v for k, v in r.items() if k not in _drop_keys}
+                for r in all_order_items
+            ]
+
+            # 画像リスト: 新規アイテム(_type="new")のみ、順番どおりに収集
+            write_imgs = []
+            for rec in all_order_items:
+                if rec.get("_type") == "new":
+                    orig_idx = rec.get("_orig_idx")
+                    if orig_idx is not None and orig_idx < len(excel_images):
+                        write_imgs.append((0, excel_images[orig_idx]))  # noは内部で決定
+
         else:
-            # フォールバック（直接書き込みボタンから来た場合）
-            all_records   = st.session_state["records"]
-            write_records = [r for r in all_records if r.get("_confirmed")]
-            write_imgs    = [(i + 1, excel_images[j])
-                             for j, (i, r) in enumerate(zip(range(len(all_records)), all_records))
-                             if r.get("_confirmed")]
+            # フォールバック（order_records のみの場合）
+            order_records = st.session_state.get("order_records", [])
+            rewrite_all   = False
+            _drop_keys    = {"_confirmed", "_ocr_engine", "_ai_error", "_fx_info",
+                             "warning", "_orig_idx", "_type"}
+            write_records = [
+                {k: v for k, v in r.items() if k not in _drop_keys}
+                for r in order_records
+            ]
+            write_imgs = [
+                (i + 1, excel_images[r["_orig_idx"]])
+                for i, r in enumerate(order_records)
+                if r.get("_orig_idx") is not None and r["_orig_idx"] < len(excel_images)
+            ]
+
         try:
             updated_bytes, results = write_receipts_to_excel(
                 st.session_state["denpyo_bytes"],
@@ -663,7 +691,8 @@ elif phase == "writing":
                 write_imgs,
                 receipt_sheet_option=st.session_state.get("receipt_sheet_option", "new"),
                 new_sheet_name=st.session_state.get("receipt_new_sheet_name", ""),
-                skip_sort=True,   # 並び替え済みなので再ソートしない
+                skip_sort=True,        # 並び替え済みなので再ソートしない
+                rewrite_all=rewrite_all,  # 既存含む場合は全書き直し
             )
             st.session_state["result_bytes"]  = updated_bytes
             st.session_state["write_results"] = results
