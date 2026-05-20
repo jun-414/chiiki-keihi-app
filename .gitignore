@@ -12,3 +12,9 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# ローカルDB（ユーザー情報・利用ログ・APIキーを保持）
+data/
+*.db
+*.db-wal
+*.db-shm

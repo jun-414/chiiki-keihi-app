@@ -196,24 +196,34 @@ def _parse_ai_json(raw: str) -> dict:
     return _json.loads(raw)
 
 
+GEMINI_MODEL = "gemini-2.0-flash"
+
+
 def _gemini_api_call(payload_dict: dict, api_key: str, timeout: int = 30) -> dict:
     """
-    Gemini API共通呼び出し（429レート制限時は自動リトライ）
-    無料枠: 15回/分 → 429が出たら最大3回、間隔を空けてリトライ
+    Gemini API共通呼び出し
+    戻り値: {"data": parsed_json, "usage": {input_tokens, output_tokens, model}}
     """
     import json as _json
     import urllib.request as _req
-    import urllib.error as _err
-    import time as _time
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
     payload = _json.dumps(payload_dict).encode()
 
     req = _req.Request(url, data=payload, headers={"content-type": "application/json"})
     with _req.urlopen(req, timeout=timeout) as r:
         result = _json.loads(r.read())
         raw = result["candidates"][0]["content"]["parts"][0]["text"]
-        return _parse_ai_json(raw)
+        meta = result.get("usageMetadata", {}) or {}
+        return {
+            "data": _parse_ai_json(raw),
+            "usage": {
+                "provider": "gemini",
+                "model": GEMINI_MODEL,
+                "input_tokens":  int(meta.get("promptTokenCount", 0)),
+                "output_tokens": int(meta.get("candidatesTokenCount", 0)),
+            },
+        }
 
 
 def _extract_with_gemini_vision(img_bytes: bytes, api_key: str) -> dict:
@@ -256,8 +266,14 @@ def _extract_with_gemini_text(text: str, api_key: str) -> dict:
     return _gemini_api_call(payload, api_key, timeout=20)
 
 
+CLAUDE_MODEL = "claude-haiku-4-5"
+
+
 def _claude_api_call(payload_dict: dict, api_key: str, timeout: int = 30) -> dict:
-    """Claude API共通呼び出し"""
+    """
+    Claude API共通呼び出し
+    戻り値: {"data": parsed_json, "usage": {input_tokens, output_tokens, model}}
+    """
     import json as _json
     import urllib.request as _req
 
@@ -274,7 +290,16 @@ def _claude_api_call(payload_dict: dict, api_key: str, timeout: int = 30) -> dic
     with _req.urlopen(req, timeout=timeout) as r:
         result = _json.loads(r.read())
         raw = result["content"][0]["text"]
-        return _parse_ai_json(raw)
+        usage = result.get("usage", {}) or {}
+        return {
+            "data": _parse_ai_json(raw),
+            "usage": {
+                "provider": "claude",
+                "model": payload_dict.get("model", CLAUDE_MODEL),
+                "input_tokens":  int(usage.get("input_tokens", 0)),
+                "output_tokens": int(usage.get("output_tokens", 0)),
+            },
+        }
 
 
 def _extract_with_claude_vision(img_bytes: bytes, api_key: str) -> dict:
@@ -298,7 +323,7 @@ def _extract_with_claude_vision(img_bytes: bytes, api_key: str) -> dict:
 
     img_b64 = base64.b64encode(img_bytes).decode()
     payload = {
-        "model": "claude-haiku-4-5",
+        "model": CLAUDE_MODEL,
         "max_tokens": 512,
         "messages": [{
             "role": "user",
@@ -322,7 +347,7 @@ def _extract_with_claude_text(text: str, api_key: str) -> dict:
     """Claude APIでテキストから抽出（フォールバック）"""
     prompt = _AI_PROMPT.replace("この領収書・レシートの画像から", "以下のOCRテキストから") + f"\n\nOCRテキスト:\n{text[:3000]}"
     payload = {
-        "model": "claude-haiku-4-5",
+        "model": CLAUDE_MODEL,
         "max_tokens": 512,
         "messages": [{"role": "user", "content": prompt}],
     }
@@ -333,6 +358,7 @@ def extract_with_ai(text: str, api_key: str, provider: str = "gemini",
                     img_bytes: bytes = None) -> dict:
     """
     AIで領収書から構造化データを抽出。
+    戻り値: {"data": {vendor, memo, date, amount}, "usage": {provider, model, input_tokens, output_tokens}}
     img_bytes があれば Vision APIで画像を直接解析（最高精度）。
     provider: "gemini"（無料） or "claude"（高速・高精度）
     """
@@ -758,11 +784,14 @@ def extract_from_file(filepath: str, filename: str = None,
 
     # ===== Vision AIで直接読み取り（APIキーあり・最高精度） =====
     ai_result = {}
+    ai_usage = None
     ai_error = ""
     if ai_api_key and vision_img_bytes:
         try:
-            ai_result = extract_with_ai("", ai_api_key, provider=ai_provider,
-                                        img_bytes=vision_img_bytes)
+            _r = extract_with_ai("", ai_api_key, provider=ai_provider,
+                                 img_bytes=vision_img_bytes)
+            ai_result = _r.get("data", {}) or {}
+            ai_usage  = _r.get("usage")
             label = "Claude Vision" if ai_provider == "claude" else "Gemini Vision"
             ocr_engine = label
         except Exception as e:
@@ -784,7 +813,9 @@ def extract_from_file(filepath: str, filename: str = None,
         # テキストベースAI
         if ai_api_key and text:
             try:
-                ai_result = extract_with_ai(text, ai_api_key, provider=ai_provider)
+                _r = extract_with_ai(text, ai_api_key, provider=ai_provider)
+                ai_result = _r.get("data", {}) or {}
+                ai_usage  = _r.get("usage")
                 label = "Claude AI" if ai_provider == "claude" else "Gemini AI"
                 ocr_engine += f" + {label}"
             except Exception as e:
@@ -849,4 +880,5 @@ def extract_from_file(filepath: str, filename: str = None,
         "_fx_info":    fx_info,
         "_currency":   currency,
         "_ai_error":   ai_error,  # AIエラー詳細（診断用）
+        "_ai_usage":   ai_usage,  # {provider, model, input_tokens, output_tokens} or None
     }
