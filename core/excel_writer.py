@@ -190,13 +190,16 @@ def write_single_row(ws, row_num: int, data: dict):
         # 日付が不正な場合はデフォルト値
         ry, mn, dy = 7, 4, 1
 
-    # ===== 書式コピー: 直前の既存行から書式を引き継ぐ =====
-    ref_row = row_num - 1 if row_num > DATA_START_ROW else DATA_START_ROW
-    # ref_rowがデータスロット行か確認（A列に数字があるか）
-    if ref_row >= DATA_START_ROW:
-        a_val = ws.cell(row=ref_row, column=1).value
-        if isinstance(a_val, (int, float)) and a_val > 0:
-            copy_row_format(ws, ref_row, row_num)
+    # ===== 書式コピー: テンプレート範囲外の行のみ =====
+    # テンプレ内の行は元の罫線（特にS4のT:medium等の特殊罫線）が
+    # そのまま使われるべきなので、コピーしない。
+    # 範囲外（74行スロット超過）の場合のみ、直前行から書式を引き継ぐ。
+    if row_num > MAX_DATA_ROW:
+        ref_row = row_num - 1
+        if ref_row >= DATA_START_ROW:
+            a_val = ws.cell(row=ref_row, column=1).value
+            if isinstance(a_val, (int, float)) and a_val > 0:
+                copy_row_format(ws, ref_row, row_num)
 
     # テンプレート範囲外（74行超）の場合はNo./令和/数式を手動で設定
     if row_num > MAX_DATA_ROW:
@@ -226,9 +229,41 @@ def write_single_row(ws, row_num: int, data: dict):
         pass  # MergedCellの場合はスキップ
 
     ws.cell(row=row_num, column=16, value=vendor)  # P: 取引先
-    # Q列（収入）: 経費なのでNone（空のまま）
-    ws.cell(row=row_num, column=18, value=amount)  # R: 支出金額
+
+    # 収入/支出を区別（_kind="income" なら Q列、それ以外は R列）
+    kind = data.get("_kind", "expense")
+    if kind == "income":
+        ws.cell(row=row_num, column=17, value=amount)  # Q: 収入金額
+        ws.cell(row=row_num, column=18, value=None)    # R: 空
+    else:
+        ws.cell(row=row_num, column=17, value=None)    # Q: 空
+        ws.cell(row=row_num, column=18, value=amount)  # R: 支出金額
     # S列（差引残高）: テンプレートの数式をそのまま使う（74行以内）
+
+    # ===== フォント情報の復元（既存行の太字等を維持） =====
+    font_info = data.get("_font_info") or {}
+    if font_info:
+        try:
+            from openpyxl.styles import Font
+            for col, info in font_info.items():
+                try:
+                    cell = ws.cell(row=row_num, column=int(col))
+                    # 既存のFontから他属性を継承しつつ bold/italic/underline を上書き
+                    base = cell.font
+                    cell.font = Font(
+                        name=base.name      if base else None,
+                        size=base.size      if base else None,
+                        family=base.family  if base else None,
+                        color=base.color    if base else None,
+                        scheme=base.scheme  if base else None,
+                        bold=bool(info.get("bold")),
+                        italic=bool(info.get("italic")),
+                        underline=info.get("underline"),
+                    )
+                except (AttributeError, ValueError):
+                    pass  # MergedCellなどスキップ
+        except Exception:
+            pass
 
 
 def _count_existing_image_slots(ws) -> int:
@@ -267,8 +302,9 @@ def add_receipt_images_to_sheet(ws, images: list):
         return
 
     ROWS_PER_IMAGE = 28   # ラベル1行 + 画像25行 + 余白2行
-    IMG_WIDTH  = 260      # px
-    IMG_HEIGHT = 340      # px
+    # スロットに収める最大サイズ（このボックス内に元アスペクト比のままフィット）
+    MAX_WIDTH  = 260      # px
+    MAX_HEIGHT = 340      # px
     START_ROW  = 2
     LEFT_COL   = "A"
     RIGHT_COL  = "G"
@@ -294,24 +330,32 @@ def add_receipt_images_to_sheet(ws, images: list):
         # No.ラベルを書き込む
         ws.cell(row=label_row, column=label_col, value=f"No.{no}")
 
-        # 画像をJPEGに変換（形式問わず安定化）
+        # 画像をJPEGに変換 + 元のサイズ取得
+        orig_w, orig_h = None, None
         try:
             from PIL import Image as PILImage
             import io as _io
             pil_img = PILImage.open(_io.BytesIO(img_bytes))
+            orig_w, orig_h = pil_img.size
             if pil_img.mode in ('RGBA', 'P', 'LA'):
                 pil_img = pil_img.convert('RGB')
             buf = _io.BytesIO()
             pil_img.save(buf, format="JPEG", quality=85)
             img_bytes = buf.getvalue()
         except Exception:
-            pass  # 変換失敗時はそのまま使用
+            pass
 
-        # 画像を貼り付け
+        # 画像を貼り付け（元の縦横比を維持してスロットにフィット）
         try:
             img = XLImage(BytesIO(img_bytes))
-            img.width  = IMG_WIDTH
-            img.height = IMG_HEIGHT
+            # PIL でサイズが取れなかった場合は openpyxl が読んだサイズを使う
+            if orig_w is None or orig_h is None:
+                orig_w = getattr(img, "width",  None) or MAX_WIDTH
+                orig_h = getattr(img, "height", None) or MAX_HEIGHT
+            # 縦横比を保ったままMAX_WIDTH×MAX_HEIGHTの中に収める
+            scale = min(MAX_WIDTH / orig_w, MAX_HEIGHT / orig_h)
+            img.width  = int(orig_w * scale)
+            img.height = int(orig_h * scale)
             img.anchor = f"{col_letter}{image_row}"
             ws.add_image(img)
         except Exception:
