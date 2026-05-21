@@ -9,7 +9,7 @@ import hashlib
 import secrets
 from typing import Optional
 
-from .db import get_conn, init_db
+from .db import get_conn, init_db, db_insert
 
 _ITERATIONS = 200_000
 _SALT_BYTES = 16
@@ -59,13 +59,13 @@ def create_user(username: str, password: str, display_name: str = "",
     display = (display_name or username).strip()
     with get_conn() as conn:
         try:
-            cur = conn.execute("""
+            return db_insert(conn, """
                 INSERT INTO users(username, display_name, password_hash, is_admin)
                 VALUES(?, ?, ?, ?)
             """, (username, display, pwd_hash, 1 if is_admin else 0))
-            return cur.lastrowid
         except Exception as e:
-            if "UNIQUE" in str(e):
+            _msg = str(e)
+            if "UNIQUE" in _msg or "duplicate" in _msg.lower():
                 raise ValueError(f"ユーザー名「{username}」はすでに使用されています")
             raise
 

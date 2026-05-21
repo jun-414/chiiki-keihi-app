@@ -18,6 +18,15 @@ import urllib.request
 from datetime import datetime
 from functools import lru_cache
 
+# HEIC（iPhone標準形式）対応: pillow-heif を PIL に登録（無ければ無効化）
+HEIC_SUPPORTED = False
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    HEIC_SUPPORTED = True
+except Exception:
+    HEIC_SUPPORTED = False
+
 
 # ===== 為替レート取得（無料API） =====
 
@@ -779,7 +788,7 @@ def extract_from_file(filepath: str, filename: str = None,
                 ocr_engine = "pdfplumber"
         except Exception:
             pass
-    elif ext in ['.jpg', '.jpeg', '.png', '.heic', '.bmp', '.tiff']:
+    elif ext in ['.jpg', '.jpeg', '.png', '.heic', '.heif', '.bmp', '.tiff']:
         vision_img_bytes = image_to_jpeg_bytes(filepath)
 
     # ===== Vision AIで直接読み取り（APIキーあり・最高精度） =====

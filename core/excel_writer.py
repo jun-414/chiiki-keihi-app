@@ -95,7 +95,9 @@ def is_duplicate(ws, date_str: str, vendor: str, amount: int) -> bool:
     同じ取引先＋金額の組み合わせが既に存在するか確認（日付・取引先・金額の3つ）
     P列（取引先）と R列（支出）が両方空の行に達したらスキャン終了
     """
-    for row_num in range(DATA_START_ROW, MAX_DATA_ROW + 1):
+    _data_end, _totals = detect_data_range(ws)
+    _scan_end = (_totals - 1) if _totals else (_data_end + 300)
+    for row_num in range(DATA_START_ROW, _scan_end + 1):
         p_val = ws.cell(row=row_num, column=16).value  # P列: 取引先
         r_val = ws.cell(row=row_num, column=18).value  # R列: 支出金額
         q_val = ws.cell(row=row_num, column=17).value  # Q列: 収入金額
@@ -167,6 +169,145 @@ def copy_row_format(ws, source_row: int, target_row: int):
         ws.row_dimensions[target_row].height = src_dim.height
 
 
+# =========================================================
+# 行の自動拡張（罫線を継ぎ足してスロットを増やす）
+# =========================================================
+def _row_has_border(ws, row: int) -> bool:
+    """代表セルに罫線があるか判定（データ行として整形済みかの目安）"""
+    for col in (3, 10, 16, 18):  # C, J, P, R
+        b = ws.cell(row=row, column=col).border
+        if b and any(getattr(b, s) and getattr(b, s).style
+                     for s in ("top", "bottom", "left", "right")):
+            return True
+    return False
+
+
+def _last_bordered_data_row(ws) -> int:
+    """一番下の「罫線付き＆A列に番号がある」データ行を返す（拡張時の手本）"""
+    data_end, totals_row = detect_data_range(ws)
+    scan_end = (totals_row - 1) if totals_row else (data_end + 300)
+    last = DATA_START_ROW
+    for row in range(DATA_START_ROW, scan_end + 1):
+        a = ws.cell(row=row, column=1).value
+        if isinstance(a, (int, float)) and a > 0 and _row_has_border(ws, row):
+            last = row
+    return last
+
+
+def _count_empty_bordered_slots(ws) -> int:
+    """罫線付きで空（P/Q/R空）のデータスロット数"""
+    data_end, totals_row = detect_data_range(ws)
+    scan_end = (totals_row - 1) if totals_row else (data_end + 300)
+    cnt = 0
+    for row in range(DATA_START_ROW, scan_end + 1):
+        a = ws.cell(row=row, column=1).value
+        if isinstance(a, (int, float)) and a > 0 and _row_has_border(ws, row):
+            p = ws.cell(row=row, column=16).value
+            q = ws.cell(row=row, column=17).value
+            r = ws.cell(row=row, column=18).value
+            if p is None and q is None and r is None:
+                cnt += 1
+    return cnt
+
+
+def _make_data_slot(ws, row: int, ref_row: int, no: int):
+    """row を ref_row を手本に「空のデータスロット」として整形する"""
+    if ref_row and ref_row != row:
+        copy_row_format(ws, ref_row, row)
+    ws.cell(row=row, column=1, value=no)        # A: No.
+    ws.cell(row=row, column=2, value="令和")     # B
+    ws.cell(row=row, column=4, value="年")       # D
+    ws.cell(row=row, column=6, value="月")       # F
+    ws.cell(row=row, column=8, value="日")       # H
+    ws.cell(row=row, column=19,                  # S: 差引残高
+            value=f"=S{row-1}+Q{row}-R{row}")
+    # 摘要 K:O を結合
+    try:
+        ws.merge_cells(f"K{row}:O{row}")
+    except Exception:
+        pass
+
+
+def _fix_totals_formulas(ws, totals_row: int, old_totals_row: int, count: int):
+    """移動後の合計行の数式を補正（SUM範囲を count 行ぶん拡張＋同一行参照の更新）"""
+    import re
+    for col in range(1, 23):
+        c = ws.cell(row=totals_row, column=col)
+        if isinstance(c.value, str) and c.value.startswith("="):
+            v = c.value
+            # SUM(X4:Xn) の終端 n を +count（ギャップ位置関係を維持）
+            v = re.sub(r'(SUM\([A-Z]+\$?\d+:[A-Z]+\$?)(\d+)(\))',
+                       lambda m: f"{m.group(1)}{int(m.group(2)) + count}{m.group(3)}", v)
+            # 同一行参照（=N79-L79 等）を新しい合計行に合わせる
+            v = re.sub(rf'(?<![0-9]){old_totals_row}(?![0-9])',
+                       str(totals_row), v)
+            c.value = v
+
+
+def expand_table(ws, count: int):
+    """
+    データスロットを count 行ぶん増やす。
+    合計行がある場合は、合計行ブロックを下げて、間に同じ体裁の空き行を作る。
+    """
+    if count <= 0:
+        return
+    from openpyxl.utils import get_column_letter
+
+    ref = _last_bordered_data_row(ws)
+    data_end, totals_row = detect_data_range(ws)
+    last_no = ws.cell(row=ref, column=1).value
+    last_no = int(last_no) if isinstance(last_no, (int, float)) else (ref - DATA_START_ROW + 1)
+
+    if not totals_row:
+        # 合計行なし → 最終データ行の次に追記
+        for i in range(1, count + 1):
+            _make_data_slot(ws, data_end + i, ref, last_no + i)
+        return
+
+    # 合計行あり: ref の直後（first_free）から下のブロックを count 行ずらす
+    first_free = ref + 1
+    max_row = ws.max_row
+
+    # 1) ブロック [first_free .. max_row] を下へ移動（下から上へコピー）
+    for r in range(max_row, first_free - 1, -1):
+        for col in range(1, 23):
+            src = ws.cell(row=r, column=col)
+            tgt = ws.cell(row=r + count, column=col)
+            tgt.value = src.value
+            if src.has_style:
+                tgt._style = copy(src._style)
+        h = ws.row_dimensions.get(r)
+        if h is not None and h.height:
+            ws.row_dimensions[r + count].height = h.height
+
+    # 2) first_free 以降の結合セルを count 行ずらす
+    for mc in list(ws.merged_cells.ranges):
+        if mc.min_row >= first_free:
+            ws.unmerge_cells(str(mc))
+            ws.merge_cells(
+                f"{get_column_letter(mc.min_col)}{mc.min_row + count}:"
+                f"{get_column_letter(mc.max_col)}{mc.max_row + count}"
+            )
+
+    # 3) 移動後の合計行の数式を補正（SUM範囲を count 行ぶん拡張）
+    new_totals_row = totals_row + count
+    _fix_totals_formulas(ws, new_totals_row, totals_row, count)
+
+    # 4) 空いた行 [first_free .. first_free+count-1] を空スロットとして整形
+    for i in range(count):
+        r = first_free + i
+        for col in range(1, 23):
+            ws.cell(row=r, column=col).value = None
+        _make_data_slot(ws, r, ref, last_no + 1 + i)
+
+
+def ensure_capacity(ws, n_needed: int):
+    """空き罫線スロットが n_needed 以上になるよう、足りなければ拡張する"""
+    empty = _count_empty_bordered_slots(ws)
+    if empty < n_needed:
+        expand_table(ws, n_needed - empty)
+
+
 def write_single_row(ws, row_num: int, data: dict):
     """
     出納簿の指定行にデータを書き込む
@@ -190,30 +331,14 @@ def write_single_row(ws, row_num: int, data: dict):
         # 日付が不正な場合はデフォルト値
         ry, mn, dy = 7, 4, 1
 
-    # ===== 書式コピー: テンプレート範囲外の行のみ =====
-    # テンプレ内の行は元の罫線（特にS4のT:medium等の特殊罫線）が
-    # そのまま使われるべきなので、コピーしない。
-    # 範囲外（74行スロット超過）の場合のみ、直前行から書式を引き継ぐ。
-    if row_num > MAX_DATA_ROW:
-        ref_row = row_num - 1
-        if ref_row >= DATA_START_ROW:
-            a_val = ws.cell(row=ref_row, column=1).value
-            if isinstance(a_val, (int, float)) and a_val > 0:
-                copy_row_format(ws, ref_row, row_num)
-
-    # テンプレート範囲外（74行超）の場合はNo./令和/数式を手動で設定
-    if row_num > MAX_DATA_ROW:
-        # No. を前の行から連番
+    # ===== 罫線がない行（テンプレスロット外）は手本を真似て整形 =====
+    # 固定行数ではなく「罫線の有無」で判定。罫線が無ければ、一番下の
+    # 罫線付きデータ行を手本に体裁（罫線・フォント・No.・ラベル・残高式）を作る。
+    if not _row_has_border(ws, row_num):
+        ref_row = _last_bordered_data_row(ws)
         prev_no = ws.cell(row=row_num - 1, column=1).value
         new_no = (prev_no + 1) if isinstance(prev_no, int) else row_num - DATA_START_ROW + 1
-        ws.cell(row=row_num, column=1, value=new_no)   # A: No.
-        ws.cell(row=row_num, column=2, value="令和")    # B
-        ws.cell(row=row_num, column=4, value="年")      # D
-        ws.cell(row=row_num, column=6, value="月")      # F
-        ws.cell(row=row_num, column=8, value="日")      # H
-        # 残高数式
-        ws.cell(row=row_num, column=19,
-                value=f"=S{row_num-1}+Q{row_num}-R{row_num}")
+        _make_data_slot(ws, row_num, ref_row, new_no)
 
     # 書き込み（既存のA, B, D, F, H列は触らない）
     ws.cell(row=row_num, column=3, value=ry)       # C: 令和年
@@ -464,6 +589,9 @@ def write_receipts_to_excel(
         # 1. 全データ行をクリア
         clear_data_rows(ws_d)
 
+        # 1.5 必要な行数ぶんスロットを確保（足りなければ罫線を継ぎ足し）
+        ensure_capacity(ws_d, len(records))
+
         # 2. 新規アイテムの画像イテレータ
         img_iter = iter(images)
 
@@ -496,6 +624,9 @@ def write_receipts_to_excel(
     else:
         # ===== 通常モード（新規追加・重複チェックあり）=====
         sorted_records = records if skip_sort else sort_records_by_date(records)
+
+        # 必要な行数ぶんスロットを確保（足りなければ罫線を継ぎ足し）
+        ensure_capacity(ws_d, len(sorted_records))
 
         for data in sorted_records:
             vendor = data.get("vendor", "不明")

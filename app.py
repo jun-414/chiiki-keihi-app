@@ -23,6 +23,7 @@ from core.auth import (
 )
 from core.db import get_setting
 from core.usage import log_usage, user_summary
+from core.history import list_history, get_history_detail
 from core.theme import (
     apply_theme, render_header, render_kpi_strip,
     render_user_badge, render_clickable_image,
@@ -159,6 +160,74 @@ def get_display_image(filepath, ext):
         return image_to_jpeg_bytes(filepath)
 
 
+def render_history_section(user_id):
+    """過去の処理履歴ビューア（KPIエリア直下・折りたたみ・コンパクト）"""
+    import pandas as _pd_h
+    with st.expander("📜 過去の処理履歴を見る", expanded=False):
+        _hist = list_history(user_id)
+        if not _hist:
+            st.caption("まだ処理履歴がありません。領収書を出納簿に書き込むと、ここに記録されます。")
+            return
+        st.caption(
+            f"過去 {len(_hist)} 回の処理（新しい順）。「詳細」で内容を表示。"
+        )
+        # 各行をコンパクトに（余白の大きい st.divider は使わない）
+        for _idx, _h in enumerate(_hist):
+            _inc = f"　/　収入 ¥{_h['income_total']:,}" if _h['income_total'] else ""
+            _hc1, _hc2 = st.columns([5, 1], vertical_alignment="center")
+            with _hc1:
+                st.markdown(
+                    f"<div style='font-size:0.86rem;line-height:1.3;'>"
+                    f"🗓 <b>{_h['processed_at']}</b>"
+                    f"<span style='color:#677291;'>"
+                    f"　{_h['record_count']}件　支出 ¥{_h['expense_total']:,}{_inc}"
+                    f"</span></div>",
+                    unsafe_allow_html=True,
+                )
+            with _hc2:
+                _opened = st.session_state.get("view_history_id") == _h['id']
+                if st.button("閉じる" if _opened else "詳細",
+                             key=f"hist_btn_{_h['id']}",
+                             use_container_width=True):
+                    st.session_state["view_history_id"] = (
+                        None if _opened else _h['id']
+                    )
+                    st.rerun()
+
+            if st.session_state.get("view_history_id") == _h['id']:
+                _detail = get_history_detail(_h['id'], user_id)
+                if _detail and _detail.get("records"):
+                    _drows = []
+                    for _rec in _detail["records"]:
+                        _kd = _rec.get("kind", "expense")
+                        _drows.append({
+                            "種別":   "💰収入" if _kd == "income" else "💴支出",
+                            "日付":   _rec.get("date", ""),
+                            "取引先": _rec.get("vendor", ""),
+                            "摘要":   _rec.get("memo", ""),
+                            "金額":   int(_rec.get("amount", 0) or 0),
+                            "勘定科目": _rec.get("kamoku", ""),
+                            "事業名": _rec.get("jigyo", ""),
+                        })
+                    _ddf = _pd_h.DataFrame(_drows)
+                    st.dataframe(
+                        _ddf, use_container_width=True, hide_index=True,
+                        column_config={
+                            "金額": st.column_config.NumberColumn(format="¥%d"),
+                        },
+                    )
+                else:
+                    st.info("詳細データが見つかりませんでした。")
+
+            # 行間の細い区切り（最後の行以外）
+            if _idx < len(_hist) - 1:
+                st.markdown(
+                    "<hr style='margin:0.35rem 0;border:none;"
+                    "border-top:1px solid #e3e7ef;'>",
+                    unsafe_allow_html=True,
+                )
+
+
 def load_template(user_name: str = "", nendo: int = None):
     """
     テンプレート出納簿を読み込み、B1の「氏名：xxx」と年度を差し替えて返す。
@@ -222,9 +291,6 @@ def init_session():
         "write_results": [],
         "receipt_sheet_option": "new",   # "new" or 既存シート名
         "receipt_new_sheet_name": "",
-        # ユーザー設定（メイン画面で入力、各フェーズで参照）
-        "user_nendo": _default_nendo,
-        "user_month": _now.month,
         "user_jigyo": JIGYO_OPTIONS[0],
         # 収入エントリ（領収書なしの収入レコードのバッファ）
         "pending_income": [],
@@ -232,6 +298,13 @@ def init_session():
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+    # 年度・月区分は「セッション初回のみ」当日基準で強制セット。
+    # （古いセッションに前回値が残っていても、初回マーカーで当日に更新）
+    if "_period_init" not in st.session_state:
+        st.session_state["_period_init"] = True
+        st.session_state["user_nendo"] = _default_nendo
+        st.session_state["user_month"] = _now.month
 
 
 def get_receipt_sheets(excel_bytes: bytes) -> list:
@@ -452,31 +525,31 @@ render_header(
     icon="📋",
 )
 
-# ===== KPIストリップ（ユーザー実績） =====
+# ===== KPIストリップ（ユーザー実績・処理履歴ベース） =====
 _today_str = datetime.now().strftime("%Y-%m-%d")
-_month_start = datetime.now().strftime("%Y-%m-01 00:00:00")
-_today_start = f"{_today_str} 00:00:00"
-_today_end   = f"{_today_str} 23:59:59"
+_month_str = datetime.now().strftime("%Y-%m")
 
 try:
-    _today_stats = user_summary(current_user["id"], _today_start, _today_end)
-    _month_stats = user_summary(current_user["id"], _month_start, _today_end)
-    _lifetime    = user_summary(current_user["id"])
+    _hist_all = list_history(current_user["id"])
 except Exception:
-    _today_stats = _month_stats = _lifetime = {
-        "calls": 0, "input_tokens": 0, "output_tokens": 0,
-        "cost_usd": 0, "cost_jpy": 0,
-    }
+    _hist_all = []
+
+_today_recs = sum(h["record_count"] for h in _hist_all
+                  if str(h.get("processed_at", "")).startswith(_today_str))
+_month_recs = sum(h["record_count"] for h in _hist_all
+                  if str(h.get("processed_at", "")).startswith(_month_str))
+_total_recs = sum(h["record_count"] for h in _hist_all)
+_hist_count = len(_hist_all)
 
 render_kpi_strip([
-    ("今日の処理", f"{_today_stats['calls']} 件",
+    ("今日の処理", f"{_today_recs} 件",
      "本日処理した領収書", "📅", "primary"),
-    ("今月の処理", f"{_month_stats['calls']} 件",
-     f"累計 {_lifetime['calls']} 件", "🗓", "teal"),
-    ("累計実績", f"{_lifetime['calls']} 件",
+    ("今月の処理", f"{_month_recs} 件",
+     f"累計 {_total_recs} 件", "🗓", "teal"),
+    ("累計実績", f"{_total_recs} 件",
      "あなたの全期間の処理件数", "📊", "blue"),
-    ("AI読み取り", "有効" if ai_api_key else "未設定",
-     ai_provider.title() if ai_api_key else "ルールベース", "🤖", "amber"),
+    ("処理履歴", f"{_hist_count} 回",
+     "下の履歴から内容を確認", "📜", "violet"),
 ])
 
 phase = st.session_state.get("phase", "upload")
@@ -486,6 +559,9 @@ phase = st.session_state.get("phase", "upload")
 # フェーズ1: アップロード
 # =========================================================
 if phase == "upload":
+    # --- 過去の処理履歴（KPIストリップ直下） ---
+    render_history_section(current_user["id"])
+
     # --- 設定バー（期間・事業を最上部に） ---
     with st.container(border=True):
         st.markdown("##### ⚙️ 処理設定")
@@ -508,18 +584,33 @@ if phase == "upload":
                 key="user_month",
             )
         with sc_j:
-            st.selectbox(
+            _jigyo_opts = JIGYO_OPTIONS + ["✏️ その他（手入力）"]
+            _sel_jigyo = st.selectbox(
                 "事業名（領収書のデフォルト）",
-                JIGYO_OPTIONS,
-                key="user_jigyo",
+                _jigyo_opts,
+                key="user_jigyo_sel",
             )
+            # 「その他」選択時は、同じ位置に空欄の入力欄を出してそのまま打ち込み
+            if _sel_jigyo == "✏️ その他（手入力）":
+                _custom_jigyo = st.text_input(
+                    "事業名（手入力）",
+                    key="user_jigyo_custom",
+                    placeholder="事業名を入力（空欄のままでもOK）",
+                    label_visibility="collapsed",
+                )
+                # 入力がなければ空欄のまま
+                st.session_state["user_jigyo"] = _custom_jigyo.strip()
+            else:
+                st.session_state["user_jigyo"] = _sel_jigyo
+
         # 表示用に再取得（widgetが書き戻したsession_stateを反映）
         nendo = st.session_state["user_nendo"]
         month = st.session_state["user_month"]
         default_jigyo = st.session_state["user_jigyo"]
         tsuki_kubun = (f"{nendo}-{month:02d}" if month >= 4
                        else f"{nendo + 1}-{month:02d}")
-        st.caption(f"📌 月区分タグ: `{tsuki_kubun}`　／　事業: `{default_jigyo}`")
+        _jigyo_disp = default_jigyo if default_jigyo else "（未設定）"
+        st.caption(f"📌 月区分タグ: `{tsuki_kubun}`　／　事業: `{_jigyo_disp}`")
 
     st.markdown("### ファイルのアップロード")
     col_l, col_r = st.columns(2, gap="large")
@@ -552,14 +643,14 @@ if phase == "upload":
             st.info("テンプレートを使用します（0件からスタート）")
 
     with col_r:
-        st.markdown("##### ② 領収書（PDF・JPG・PNG / 複数可）")
+        st.markdown("##### ② 領収書（PDF・JPG・PNG・HEIC / 複数可）")
         receipt_files = st.file_uploader(
             "領収書アップロード",
-            type=["pdf", "jpg", "jpeg", "png"],
+            type=["pdf", "jpg", "jpeg", "png", "heic", "heif"],
             accept_multiple_files=True,
             key="receipt_up",
             label_visibility="collapsed",
-            help="複数ファイルをまとめて選択／ドラッグできます",
+            help="複数ファイルをまとめて選択／ドラッグできます。iPhoneのHEIC写真もそのままOK",
         )
         if receipt_files:
             st.success(f"✅ {len(receipt_files)}件 選択済み")
@@ -1038,12 +1129,14 @@ elif phase == "review":
                             index=kamoku_idx,
                         )
                     with r4c2:
-                        jigyo_idx = (JIGYO_OPTIONS.index(record.get("jigyo", "ミッション活動"))
-                                     if record.get("jigyo") in JIGYO_OPTIONS else 0)
+                        # カスタム事業名（その他で入力した値）も選択肢に含めて保持
+                        _jg_cur = record.get("jigyo", "ミッション活動")
+                        _jg_opts = (JIGYO_OPTIONS if _jg_cur in JIGYO_OPTIONS
+                                    else JIGYO_OPTIONS + [_jg_cur])
                         jigyo_val = st.selectbox(
                             "🎯 事業名",
-                            options=JIGYO_OPTIONS,
-                            index=jigyo_idx,
+                            options=_jg_opts,
+                            index=_jg_opts.index(_jg_cur),
                         )
 
                     # 確定ボタン
@@ -1343,6 +1436,27 @@ elif phase == "writing":
             )
             st.session_state["result_bytes"]  = updated_bytes
             st.session_state["write_results"] = results
+
+            # 処理履歴を保存（今回追加した「新規」レコードのみ）
+            try:
+                from core.history import save_history
+                if all_order_items:
+                    _new_recs = [r for r in all_order_items
+                                 if r.get("_type") == "new"]
+                else:
+                    _new_recs = st.session_state.get("order_records", [])
+                if _new_recs:
+                    _sheet = (st.session_state.get("receipt_new_sheet_name")
+                              or st.session_state.get("receipt_sheet_option", ""))
+                    save_history(
+                        user_id=current_user["id"],
+                        username=current_user["username"],
+                        records=_new_recs,
+                        sheet_name=_sheet,
+                    )
+            except Exception:
+                pass
+
             st.session_state["phase"] = "done"
         except Exception as e:
             st.error(f"エラー: {e}")
