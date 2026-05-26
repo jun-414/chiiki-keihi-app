@@ -9,6 +9,11 @@ import tempfile
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from PIL import Image as _PILImage
+
+# ファビコン: assets/favicon.png（透過PNG）。無ければ絵文字にフォールバック
+_FAVICON_PATH = os.path.join(os.path.dirname(__file__), "assets", "favicon.png")
+_PAGE_ICON = _PILImage.open(_FAVICON_PATH) if os.path.exists(_FAVICON_PATH) else "📋"
 
 from core.extract import (
     extract_from_file,
@@ -35,7 +40,7 @@ from core.theme import (
 # =========================================================
 st.set_page_config(
     page_title="地域おこし 経費管理",
-    page_icon="📋",
+    page_icon=_PAGE_ICON,
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -348,19 +353,29 @@ def read_existing_rows(excel_bytes: bytes) -> list:
     rows = []
     try:
         import openpyxl
+        from core.excel_writer import detect_data_range, DATA_START_ROW
         # 書式情報を取りたいので read_only=False
         wb = openpyxl.load_workbook(io.BytesIO(excel_bytes), data_only=False)
         if "出納簿" not in wb.sheetnames:
             return rows
         ws = wb["出納簿"]
-        for row_num in range(4, ws.max_row + 1):
+        # 合計行を除いた末尾までだけ読む
+        _data_end, _totals_row = detect_data_range(ws)
+        scan_end = (_totals_row - 1) if _totals_row else (_data_end + 50)
+        for row_num in range(DATA_START_ROW, scan_end + 1):
             a = ws.cell(row=row_num, column=1).value   # No.
             p = ws.cell(row=row_num, column=16).value  # 取引先
             q = ws.cell(row=row_num, column=17).value  # 収入
             r = ws.cell(row=row_num, column=18).value  # 支出
-            if p is None and q is None and r is None:
+            # 合計行や数式行はスキップ（P列が "=..." 等）
+            if isinstance(p, str) and p.startswith("="):
                 continue
-            if not isinstance(a, (int, float)):
+            # 取引先・収入・支出のいずれかが入っていればデータ行として扱う
+            # （A列のNo.が空でもQ/Rに金額があれば収入/支出として取り込む）
+            has_vendor = p is not None and str(p).strip() != ""
+            has_income = isinstance(q, (int, float)) and q
+            has_expense = isinstance(r, (int, float)) and r
+            if not (has_vendor or has_income or has_expense):
                 continue
             c  = ws.cell(row=row_num, column=3).value   # 令和年
             e  = ws.cell(row=row_num, column=5).value   # 月
@@ -844,11 +859,7 @@ if phase == "upload":
         # バッファクリア
         st.session_state["pending_income"] = []
 
-        # 日付の古い順に並べ替え（日付なしは末尾）
-        if records:
-            combined = list(zip(records, images, excel_images, filenames))
-            combined.sort(key=lambda x: (x[0].get("date") or "9999-99-99"))
-            records, images, excel_images, filenames = [list(t) for t in zip(*combined)]
+        # 並び替えはユーザーに任せる（自動ソートはしない）
 
         # アニメーション撤去
         try:
@@ -906,7 +917,7 @@ elif phase == "review":
                 st.rerun()
         with ac3:
             write_disabled = (confirmed_count == 0)
-            if st.button(f"次へ：順番を確認 ({confirmed_count}件)",
+            if st.button(f"次へ：順番を確認 ({confirmed_count}件) →",
                          type="primary", use_container_width=True,
                          disabled=write_disabled):
                 all_records = st.session_state["records"]
@@ -1158,6 +1169,43 @@ elif phase == "review":
                         })
                         st.rerun()
 
+    # --- ボトムアクションバー（スクロール後にも次へ進める） ---
+    st.divider()
+    _confirmed_now = sum(1 for r in st.session_state["records"] if r.get("_confirmed"))
+    bc1, bc2, bc3 = st.columns([1, 1, 1.4])
+    with bc1:
+        if st.button("← アップロードに戻る",
+                     use_container_width=True, key="review_back_bottom"):
+            st.session_state["phase"] = "upload"
+            st.rerun()
+    with bc2:
+        if st.button("全件まとめて確定",
+                     use_container_width=True, key="review_confirm_all_bottom"):
+            for r in st.session_state["records"]:
+                r["_confirmed"] = True
+            st.rerun()
+    with bc3:
+        _write_disabled_b = (_confirmed_now == 0)
+        if st.button(f"次へ：順番を確認 ({_confirmed_now}件) →",
+                     type="primary", use_container_width=True,
+                     key="review_next_bottom",
+                     disabled=_write_disabled_b):
+            all_records = st.session_state["records"]
+            new_items = [
+                {**r, "_type": "new", "_orig_idx": j}
+                for j, r in enumerate(all_records)
+                if r.get("_confirmed")
+            ]
+            with st.spinner("既存データを読み込み中..."):
+                existing_items = read_existing_rows(
+                    st.session_state.get("denpyo_bytes", b"")
+                )
+            all_order_items = existing_items + new_items
+            st.session_state["all_order_items"] = all_order_items
+            st.session_state["order_records"]   = new_items
+            st.session_state["phase"] = "order"
+            st.rerun()
+
 
 # =========================================================
 # フェーズ2.5: 順番確認・並び替え（既存＋新規を一覧で並び替え）
@@ -1193,7 +1241,7 @@ elif phase == "order":
         with ac1:
             st.markdown("##### 📋 書き込み順番の確認・並び替え")
             st.caption(
-                "🖱 各行をドラッグして並び替え、または日付ボタンで一括ソートできます。"
+                "🖱 各行のNo.列をつかんで上下にドラッグすると順番を入れ替えられます。"
                 + ("　📂 既存データも含めて並び替え可能（書き込み時は全件を指定順で書き直し）" if ex_count > 0 else "")
             )
         with ac2:
@@ -1210,34 +1258,6 @@ elif phase == "order":
     if not all_order_items:
         st.warning("書き込むデータがありません")
     else:
-        # ===== 一括ソートボタン =====
-        sc1, sc2, sc3, sc4, _sp = st.columns([1.2, 1.2, 1.2, 1.2, 4])
-        _no_date_last = lambda r: (r.get("date") or "9999-99-99")
-        with sc1:
-            if st.button("📅 日付 古い順", use_container_width=True):
-                items = list(st.session_state["all_order_items"])
-                items.sort(key=_no_date_last)
-                st.session_state["all_order_items"] = items
-                st.rerun()
-        with sc2:
-            if st.button("📅 日付 新しい順", use_container_width=True):
-                items = list(st.session_state["all_order_items"])
-                items.sort(key=_no_date_last, reverse=True)
-                st.session_state["all_order_items"] = items
-                st.rerun()
-        with sc3:
-            if st.button("💴 金額 高い順", use_container_width=True):
-                items = list(st.session_state["all_order_items"])
-                items.sort(key=lambda r: int(r.get("amount", 0) or 0), reverse=True)
-                st.session_state["all_order_items"] = items
-                st.rerun()
-        with sc4:
-            if st.button("🏪 取引先順", use_container_width=True):
-                items = list(st.session_state["all_order_items"])
-                items.sort(key=lambda r: r.get("vendor", ""))
-                st.session_state["all_order_items"] = items
-                st.rerun()
-
         # ===== 出納簿風プレビュー（AgGrid: ドラッグで並び替え） =====
         items = st.session_state.get("all_order_items", all_order_items)
         _rows = []
@@ -1503,10 +1523,30 @@ elif phase == "done":
         )
 
     st.divider()
-    if st.button("📋 続けて処理する（次の月など）", use_container_width=True):
-        st.session_state.update({
-            "denpyo_bytes": result_bytes,
-            "records": [], "images": [], "excel_images": [],
-            "filenames": [], "phase": "upload",
-        })
-        st.rerun()
+    st.markdown("##### やり直す・続ける")
+    st.caption("間違いに気付いたら戻って修正できます。修正後は再度 Excel に書き直されます。")
+    bc1, bc2, bc3 = st.columns(3)
+    with bc1:
+        if st.button("← 確認・編集に戻る", use_container_width=True,
+                     help="領収書1件ずつの内容を修正できます"):
+            st.session_state["phase"] = "review"
+            st.rerun()
+    with bc2:
+        if st.button("← 順番調整に戻る", use_container_width=True,
+                     help="書き込み順を入れ替えてやり直します",
+                     disabled=not st.session_state.get("all_order_items")):
+            st.session_state["phase"] = "order"
+            st.rerun()
+    with bc3:
+        if st.button("📋 続けて処理する（次の月など）", use_container_width=True,
+                     type="primary",
+                     help="今ダウンロードしたExcelを起点に次の月の処理へ進みます"):
+            st.session_state.update({
+                "denpyo_bytes": result_bytes,
+                "records": [], "images": [], "excel_images": [],
+                "filenames": [],
+                "all_order_items": [], "order_records": [],
+                "result_bytes": None, "write_results": [],
+                "phase": "upload",
+            })
+            st.rerun()
