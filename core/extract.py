@@ -168,6 +168,7 @@ _AI_PROMPT = """あなたは日本の領収書・レシート解析の専門家�
 この領収書・レシートから5つの情報を読み取り、必ずJSON形式のみで返してください。
 
 【重要】返答はJSON1行のみ。前置き・説明・マークダウン・コードブロック（```）は一切不要。
+【注意】画像が横向き・逆さま・斜めに回転していることがあります。その場合は文字の向きを正しく読み取る向きに頭の中で回転させてから、内容を読み取ってください。向きが分からない数字や文字を当てずっぽうで書かないこと。
 
 返答例:
 {"vendor": "ホクレン 根室SS", "memo": "ガソリン給油", "date": "2026-03-15", "amount": 8540, "kamoku": "燃料費"}
@@ -777,11 +778,17 @@ def pdf_to_image_bytes(filepath: str, zoom: float = 2.0) -> bytes:
 
 
 def image_to_jpeg_bytes(filepath: str) -> bytes:
-    """画像ファイルをJPEGバイト列に変換"""
+    """画像ファイルをJPEGバイト列に変換（EXIFの回転情報を反映して正立させる）"""
     try:
-        from PIL import Image as PILImage
+        from PIL import Image as PILImage, ImageOps
         import io
         img = PILImage.open(filepath)
+        # iPhone等の写真はEXIFに回転情報を持つ。これを実ピクセルに適用して正立させる
+        # （これをしないと横向き・逆さまのままAIに渡り、読み取りが乱れる）
+        try:
+            img = ImageOps.exif_transpose(img)
+        except Exception:
+            pass
         if img.mode in ('RGBA', 'P'):
             img = img.convert('RGB')
         buf = io.BytesIO()

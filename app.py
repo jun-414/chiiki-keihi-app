@@ -859,7 +859,11 @@ if phase == "upload":
         # バッファクリア
         st.session_state["pending_income"] = []
 
-        # 並び替えはユーザーに任せる（自動ソートはしない）
+        # 読み込み後は日付の古い順に自動で並べ替える（日付なしは末尾）
+        if records:
+            combined = list(zip(records, images, excel_images, filenames))
+            combined.sort(key=lambda x: (x[0].get("date") or "9999-99-99"))
+            records, images, excel_images, filenames = [list(t) for t in zip(*combined)]
 
         # アニメーション撤去
         try:
@@ -1090,6 +1094,20 @@ elif phase == "review":
                 if record.get("_ai_error"):
                     st.error(f"⚠️ AI読み取りエラー: {record['_ai_error']}")
 
+                # この領収書を読み込みから削除（間違えて読み込んだ時用）
+                if st.button(
+                    "🗑 この領収書を削除",
+                    key=f"del_rec_{i}_{filename}",
+                    use_container_width=True,
+                    help="間違えて読み込んだ領収書を一覧から取り除きます（元ファイルは消えません）",
+                ):
+                    for _lst in ("records", "images", "excel_images", "filenames"):
+                        try:
+                            st.session_state[_lst].pop(i)
+                        except (IndexError, KeyError, AttributeError):
+                            pass
+                    st.rerun()
+
             # 右: 編集フォーム（整理された2行レイアウト）
             with form_col:
                 with st.form(key=f"form_{i}_{filename}"):
@@ -1140,14 +1158,19 @@ elif phase == "review":
                             index=kamoku_idx,
                         )
                     with r4c2:
-                        # カスタム事業名（その他で入力した値）も選択肢に含めて保持
+                        # 事業名: プリセット選択 ＋ 自由入力（入力があれば自由入力を優先）
                         _jg_cur = record.get("jigyo", "ミッション活動")
-                        _jg_opts = (JIGYO_OPTIONS if _jg_cur in JIGYO_OPTIONS
-                                    else JIGYO_OPTIONS + [_jg_cur])
-                        jigyo_val = st.selectbox(
-                            "🎯 事業名",
-                            options=_jg_opts,
-                            index=_jg_opts.index(_jg_cur),
+                        _jg_is_preset = _jg_cur in JIGYO_OPTIONS
+                        jigyo_sel = st.selectbox(
+                            "🎯 事業名（選択）",
+                            options=JIGYO_OPTIONS,
+                            index=(JIGYO_OPTIONS.index(_jg_cur)
+                                   if _jg_is_preset else 0),
+                        )
+                        jigyo_custom = st.text_input(
+                            "✏️ 事業名を自由入力（入力するとこちらを優先）",
+                            value="" if _jg_is_preset else _jg_cur,
+                            placeholder="自由入力する場合のみ記入",
                         )
 
                     # 確定ボタン
@@ -1158,6 +1181,8 @@ elif phase == "review":
                         type="primary" if not confirmed else "secondary",
                     )
                     if submitted:
+                        # 自由入力が入っていればそれを、無ければ選択値を採用
+                        jigyo_val = jigyo_custom.strip() or jigyo_sel
                         st.session_state["records"][i].update({
                             "date":     date_val,
                             "vendor":   vendor_val,
