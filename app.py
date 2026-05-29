@@ -1241,7 +1241,8 @@ elif phase == "order":
         with ac1:
             st.markdown("##### 📋 書き込み順番の確認・並び替え")
             st.caption(
-                "🖱 各行のNo.列をつかんで上下にドラッグすると順番を入れ替えられます。"
+                "🖱 No.列をつかんで上下にドラッグで並び替え。"
+                "☑️ 左端のチェックで複数行を選び、まとめてドラッグもできます。"
                 + ("　📂 既存データも含めて並び替え可能（書き込み時は全件を指定順で書き直し）" if ex_count > 0 else "")
             )
         with ac2:
@@ -1319,8 +1320,9 @@ elif phase == "order":
         gb.configure_column("_idx",  hide=True)
         gb.configure_column("_type", hide=True)
         gb.configure_column("_kind", hide=True)
-        # 表示列
-        gb.configure_column("No.",     width=70,  pinned="left", rowDrag=True)
+        # 表示列（No.列にチェックボックス＋ドラッグハンドルを同居）
+        gb.configure_column("No.",     width=120, pinned="left", rowDrag=True,
+                            checkboxSelection=True, headerCheckboxSelection=True)
         gb.configure_column("種別",    width=90)
         gb.configure_column("日付",    width=150)
         gb.configure_column("事業名",  width=120)
@@ -1335,6 +1337,9 @@ elif phase == "order":
                             cellStyle={"color": "#8a4708", "fontWeight": "600"})
         gb.configure_grid_options(
             rowDragManaged=True,
+            rowDragMultiRow=True,        # 複数選択した行をまとめてドラッグ
+            rowSelection="multiple",     # 複数行選択を許可
+            suppressRowClickSelection=True,  # 選択はチェックボックスのみ（誤選択防止）
             animateRows=True,
             getRowStyle=row_style_js,
             domLayout='normal',
@@ -1378,7 +1383,7 @@ elif phase == "order":
             'border:1px solid #d6dde6;color:#3e4a6a;font-size:0.8rem;font-weight:600">'
             '📂 既存データ</span>　'
             '<span style="color:#677291;font-size:0.78rem;">'
-            'No.列をつかんで上下にドラッグすると順番を入れ替えられます</span>',
+            'No.列をドラッグで並び替え／左端☑️で複数選択してまとめて移動</span>',
             unsafe_allow_html=True,
         )
 
