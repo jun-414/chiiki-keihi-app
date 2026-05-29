@@ -798,6 +798,103 @@ def image_to_jpeg_bytes(filepath: str) -> bytes:
         return None
 
 
+# ===== 画像の向き自動補正（回転スキャン・横向き写真対策） =====
+
+def _ocr_text_for_orientation(pil_img) -> str:
+    """
+    向き判定用の軽量OCR。アプリ共通の run_ocr（Apple Vision→tesseract）を再利用。
+    判定用途なので長辺1600pxに縮小して高速化する。
+    """
+    try:
+        from PIL import Image as _PIL
+        import io as _io
+        work = pil_img.convert("RGB")
+        long_side = max(work.size)
+        if long_side > 1600:
+            scale = 1600 / long_side
+            work = work.resize(
+                (max(1, int(work.size[0] * scale)),
+                 max(1, int(work.size[1] * scale))),
+                _PIL.LANCZOS,
+            )
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            work.save(tmp, format="JPEG", quality=80)
+            tmp_path = tmp.name
+    except Exception:
+        return ""
+    try:
+        text, _ = run_ocr(tmp_path)
+        return text or ""
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+def _orientation_score(text: str) -> int:
+    """OCRテキストの妥当性スコア = 日本語(かな・漢字)＋数字の文字数。"""
+    if not text:
+        return 0
+    return len(re.findall(r'[぀-ヿ一-鿿0-9]', text))
+
+
+def _is_garbled_text(text: str) -> bool:
+    """
+    スキャナが埋め込んだOCRテキスト層が文字化けゴミかどうかを判定。
+
+    日本語の領収書テキストは必ずある程度ひらがなを含む（「です」「として」
+    「円を含みます」「お預り」「釣銭」等）。一方スキャナOCRの文字化けは
+    ランダムな漢字ばかりでひらがながほとんど無い、という特徴がある。
+    → 漢字が十分あるのにひらがな比率が極端に低ければゴミとみなす。
+    """
+    s = [c for c in text if not c.isspace()]
+    if len(s) < 20:
+        return False
+    hira  = re.findall(r'[\u3041-\u3093]', text)
+    kanji = re.findall(r'[\u4e00-\u9fff]', text)
+    return len(kanji) >= 25 and (len(hira) / len(s)) < 0.07
+
+
+def auto_orient_image(img_bytes: bytes) -> bytes:
+    """
+    文字の向きをOCRで判定して画像を正立させる（回転スキャンPDF・横向き写真対策）。
+
+    0°/90°/180°/270° を試し、最も多く文字が読めた向きを採用する。
+    - 0°で十分読めていれば回転せずそのまま（高速パス）
+    - OCRが使えない/明確な改善が無い場合は元画像を返す（正立画像を壊さない安全側）
+    """
+    if not img_bytes:
+        return img_bytes
+    try:
+        from PIL import Image as _PIL
+        import io as _io
+        img = _PIL.open(_io.BytesIO(img_bytes))
+
+        # 0度で十分読めているか（高速パス）
+        score0 = _orientation_score(_ocr_text_for_orientation(img))
+        if score0 >= 25:
+            return img_bytes
+
+        best_angle, best_score = 0, score0
+        for angle in (90, 180, 270):
+            rotated = img.rotate(-angle, expand=True)  # -angle = 時計回り
+            score = _orientation_score(_ocr_text_for_orientation(rotated))
+            if score > best_score:
+                best_score, best_angle = score, angle
+
+        # 0度のまま、または改善がわずかなら回さない
+        if best_angle == 0 or best_score < max(score0 * 1.3, score0 + 8):
+            return img_bytes
+
+        out = img.rotate(-best_angle, expand=True).convert("RGB")
+        buf = _io.BytesIO()
+        out.save(buf, format="JPEG", quality=90)
+        return buf.getvalue()
+    except Exception:
+        return img_bytes
+
+
 # ===== メイン抽出関数 =====
 
 def extract_from_file(filepath: str, filename: str = None,
@@ -820,7 +917,8 @@ def extract_from_file(filepath: str, filename: str = None,
 
     # ===== ファイルを画像化（Gemini Vision / OCR 共用） =====
     if ext == '.pdf':
-        vision_img_bytes = pdf_to_image_bytes(filepath, zoom=2.0)
+        # スキャンPDFは文字が小さいので高解像度で描画（読み取り精度向上）
+        vision_img_bytes = pdf_to_image_bytes(filepath, zoom=3.0)
         # テキストPDFならpdfplumberでも取得
         try:
             import pdfplumber
@@ -830,12 +928,22 @@ def extract_from_file(filepath: str, filename: str = None,
                     if t:
                         text += t + "\n"
             text = text.strip()
+            # スキャナが埋め込んだOCR層が文字化けゴミの場合は捨てる
+            # （ゴミテキストを使うと誤抽出するため、画像OCRに切り替える）
+            if text and _is_garbled_text(text):
+                text = ""
             if text:
                 ocr_engine = "pdfplumber"
         except Exception:
             pass
     elif ext in ['.jpg', '.jpeg', '.png', '.heic', '.heif', '.bmp', '.tiff']:
         vision_img_bytes = image_to_jpeg_bytes(filepath)
+
+    # ===== 文字の向きを自動補正（回転スキャンPDF・横向き写真対策） =====
+    # AIに渡る画像が横向き/逆さまだと誤読み取り（ハルシネーション）が起きるため、
+    # OCRで正立向きを判定してから渡す。
+    if vision_img_bytes:
+        vision_img_bytes = auto_orient_image(vision_img_bytes)
 
     # ===== Vision AIで直接読み取り（APIキーあり・最高精度） =====
     ai_result = {}
