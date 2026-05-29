@@ -800,43 +800,118 @@ def image_to_jpeg_bytes(filepath: str) -> bytes:
 
 # ===== 画像の向き自動補正（回転スキャン・横向き写真対策） =====
 
-def _ocr_text_for_orientation(pil_img) -> str:
-    """
-    向き判定用の軽量OCR。アプリ共通の run_ocr（Apple Vision→tesseract）を再利用。
-    判定用途なので長辺1600pxに縮小して高速化する。
-    """
+def _rotate_jpeg_bytes(img_bytes: bytes, deg: int) -> bytes:
+    """画像を deg 度(PIL基準=反時計回り正)回転してJPEGバイトで返す。"""
+    if not img_bytes or not deg:
+        return img_bytes
     try:
         from PIL import Image as _PIL
         import io as _io
-        work = pil_img.convert("RGB")
-        long_side = max(work.size)
-        if long_side > 1600:
-            scale = 1600 / long_side
-            work = work.resize(
-                (max(1, int(work.size[0] * scale)),
-                 max(1, int(work.size[1] * scale))),
-                _PIL.LANCZOS,
-            )
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            work.save(tmp, format="JPEG", quality=80)
-            tmp_path = tmp.name
+        img = _PIL.open(_io.BytesIO(img_bytes))
+        out = img.rotate(deg, expand=True).convert("RGB")
+        buf = _io.BytesIO()
+        out.save(buf, format="JPEG", quality=90)
+        return buf.getvalue()
     except Exception:
-        return ""
-    try:
-        text, _ = run_ocr(tmp_path)
-        return text or ""
-    finally:
+        return img_bytes
+
+
+def _parse_upright_index(raw: str):
+    """向き判定AIの応答から正立画像の番号(0-3)を取り出す。失敗時None。"""
+    if not raw:
+        return None
+    import json as _json
+    cleaned = re.sub(r'^```[a-z]*\n?|```$', '', raw.strip(), flags=re.MULTILINE).strip()
+    m = re.search(r'\{.*\}', cleaned, re.DOTALL)
+    if m:
         try:
-            os.unlink(tmp_path)
+            v = _json.loads(m.group()).get("upright")
+            if isinstance(v, (int, float)):
+                return int(v)
         except Exception:
             pass
+    m2 = re.search(r'[0-3]', cleaned)
+    return int(m2.group()) if m2 else None
 
 
-def _orientation_score(text: str) -> int:
-    """OCRテキストの妥当性スコア = 日本語(かな・漢字)＋数字の文字数。"""
-    if not text:
+def _vision_multi_image_raw(thumbs_b64: list, prompt: str, api_key: str,
+                            provider: str, max_tokens: int = 40,
+                            timeout: int = 30) -> str:
+    """複数画像＋プロンプトをVision AIに送り、生のテキスト応答を返す。"""
+    import json as _json
+    import urllib.request as _req
+    if provider == "claude":
+        content = []
+        for i, b in enumerate(thumbs_b64):
+            content.append({"type": "text", "text": f"画像{i}:"})
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": "image/jpeg", "data": b}})
+        content.append({"type": "text", "text": prompt})
+        payload = {"model": CLAUDE_MODEL, "max_tokens": max_tokens,
+                   "messages": [{"role": "user", "content": content}]}
+        req = _req.Request("https://api.anthropic.com/v1/messages",
+                           data=_json.dumps(payload).encode(),
+                           headers={"x-api-key": api_key,
+                                    "anthropic-version": "2023-06-01",
+                                    "content-type": "application/json"})
+        with _req.urlopen(req, timeout=timeout) as r:
+            return _json.loads(r.read())["content"][0]["text"]
+    else:
+        parts = []
+        for i, b in enumerate(thumbs_b64):
+            parts.append({"text": f"画像{i}:"})
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b}})
+        parts.append({"text": prompt})
+        payload = {"contents": [{"parts": parts}],
+                   "generationConfig": {"maxOutputTokens": max_tokens,
+                                        "temperature": 0.0}}
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{GEMINI_MODEL}:generateContent?key={api_key}")
+        req = _req.Request(url, data=_json.dumps(payload).encode(),
+                           headers={"content-type": "application/json"})
+        with _req.urlopen(req, timeout=timeout) as r:
+            res = _json.loads(r.read())
+            return res["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def detect_upright_rotation(img_bytes: bytes, api_key: str,
+                            provider: str = "claude") -> int:
+    """
+    Vision AIに4方向の縮小画像を見せ、文字が正立して最も読める向きを選ばせる。
+
+    Visionモデルは「回転角の計算」は苦手だが「どれが読めるか」の判断は得意なため、
+    回転候補(0/90/180/270)を見せて選択させる方式にしている。
+    戻り値: 元画像に適用すべき回転角(PIL基準=反時計回り正, 0/90/180/270)。
+            APIキー無し・判定失敗時は 0（回転しない）。
+    """
+    if not (img_bytes and api_key):
         return 0
-    return len(re.findall(r'[぀-ヿ一-鿿0-9]', text))
+    try:
+        from PIL import Image as _PIL
+        import io as _io
+        import base64 as _b64
+        img = _PIL.open(_io.BytesIO(img_bytes))
+        angles = (0, 90, 180, 270)
+        thumbs = []
+        for a in angles:
+            t = img.rotate(a, expand=True)
+            t.thumbnail((560, 560))
+            buf = _io.BytesIO()
+            t.convert("RGB").save(buf, format="JPEG", quality=75)
+            thumbs.append(_b64.b64encode(buf.getvalue()).decode())
+        prompt = (
+            "以下の画像0〜3は同じ領収書・レシートを回転させたものです。"
+            "文字が正立して最も正しく読める画像はどれですか。"
+            "番号だけをJSONで返してください。前置きや説明は不要。"
+            '例: {"upright": 3}'
+        )
+        raw = _vision_multi_image_raw(thumbs, prompt, api_key, provider)
+        idx = _parse_upright_index(raw)
+        if idx is None or not (0 <= idx < 4):
+            return 0
+        return angles[idx]
+    except Exception:
+        return 0
 
 
 def _is_garbled_text(text: str) -> bool:
@@ -855,44 +930,6 @@ def _is_garbled_text(text: str) -> bool:
     kanji = re.findall(r'[\u4e00-\u9fff]', text)
     return len(kanji) >= 25 and (len(hira) / len(s)) < 0.07
 
-
-def auto_orient_image(img_bytes: bytes) -> bytes:
-    """
-    文字の向きをOCRで判定して画像を正立させる（回転スキャンPDF・横向き写真対策）。
-
-    0°/90°/180°/270° を試し、最も多く文字が読めた向きを採用する。
-    - 0°で十分読めていれば回転せずそのまま（高速パス）
-    - OCRが使えない/明確な改善が無い場合は元画像を返す（正立画像を壊さない安全側）
-    """
-    if not img_bytes:
-        return img_bytes
-    try:
-        from PIL import Image as _PIL
-        import io as _io
-        img = _PIL.open(_io.BytesIO(img_bytes))
-
-        # 0度で十分読めているか（高速パス）
-        score0 = _orientation_score(_ocr_text_for_orientation(img))
-        if score0 >= 25:
-            return img_bytes
-
-        best_angle, best_score = 0, score0
-        for angle in (90, 180, 270):
-            rotated = img.rotate(-angle, expand=True)  # -angle = 時計回り
-            score = _orientation_score(_ocr_text_for_orientation(rotated))
-            if score > best_score:
-                best_score, best_angle = score, angle
-
-        # 0度のまま、または改善がわずかなら回さない
-        if best_angle == 0 or best_score < max(score0 * 1.3, score0 + 8):
-            return img_bytes
-
-        out = img.rotate(-best_angle, expand=True).convert("RGB")
-        buf = _io.BytesIO()
-        out.save(buf, format="JPEG", quality=90)
-        return buf.getvalue()
-    except Exception:
-        return img_bytes
 
 
 # ===== メイン抽出関数 =====
@@ -941,9 +978,17 @@ def extract_from_file(filepath: str, filename: str = None,
 
     # ===== 文字の向きを自動補正（回転スキャンPDF・横向き写真対策） =====
     # AIに渡る画像が横向き/逆さまだと誤読み取り（ハルシネーション）が起きるため、
-    # OCRで正立向きを判定してから渡す。
-    if vision_img_bytes:
-        vision_img_bytes = auto_orient_image(vision_img_bytes)
+    # Vision AI自身に4方向の縮小画像を見せて正立向きを判定させ、回転してから本抽出に渡す。
+    # デジタルPDF（pdfplumberでクリーンな水平テキストが取れている）は正立確実なので
+    # 向き判定の余計なAPI呼び出しをスキップする。
+    _is_digital_pdf = bool(text)
+    if vision_img_bytes and ai_api_key and not _is_digital_pdf:
+        try:
+            _rot = detect_upright_rotation(vision_img_bytes, ai_api_key, ai_provider)
+            if _rot:
+                vision_img_bytes = _rotate_jpeg_bytes(vision_img_bytes, _rot)
+        except Exception:
+            pass
 
     # ===== Vision AIで直接読み取り（APIキーあり・最高精度） =====
     ai_result = {}
