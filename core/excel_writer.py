@@ -752,7 +752,12 @@ def write_receipts_to_excel(
                         sub += 1
                 except StopIteration:
                     pass
-                # 補足資料（recordに保持）
+                # 複数ページPDFの2ページ目以降（自動取り込み）
+                for sb in (data.get("_pdf_extra_pages") or []):
+                    if sb and new_no is not None:
+                        all_no_images.append((new_no, sub, sb))
+                        sub += 1
+                # 補足資料（ユーザーが追加した分）
                 for sb in (data.get("supplements") or []):
                     if sb and new_no is not None:
                         all_no_images.append((new_no, sub, sb))
@@ -810,6 +815,11 @@ def write_receipts_to_excel(
                 _, main_img = images[idx]
                 if main_img and no is not None:
                     all_no_images.append((no, sub, main_img))
+                    sub += 1
+            # 複数ページPDFの2ページ目以降（自動取り込み）
+            for sb in (data.get("_pdf_extra_pages") or []):
+                if sb and no is not None:
+                    all_no_images.append((no, sub, sb))
                     sub += 1
             # 補足資料
             for sb in (data.get("supplements") or []):

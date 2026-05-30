@@ -160,6 +160,63 @@ def require_login() -> dict:
 # =========================================================
 # ヘルパー
 # =========================================================
+def _combine_pages_vertically(page_bytes_list, gap=24,
+                              bg_color=(245, 245, 245)):
+    """
+    複数ページのJPEGバイト列を縦方向に連結して1枚のJPEGバイト列にする。
+    ページ幅は最も広いページに揃え、間に薄いグレー帯を入れて区切りを示す。
+    """
+    pages = [pb for pb in (page_bytes_list or []) if pb]
+    if not pages:
+        return None
+    if len(pages) == 1:
+        return pages[0]
+    try:
+        from PIL import Image as _PIL
+        import io as _io
+        pils = []
+        for pb in pages:
+            try:
+                pils.append(_PIL.open(_io.BytesIO(pb)).convert("RGB"))
+            except Exception:
+                pass
+        if not pils:
+            return None
+        max_w = max(p.width for p in pils)
+        # 大きすぎる場合のメモリ対策（連結後の最大高さを 8000px に制限）
+        sized = []
+        for p in pils:
+            if p.width != max_w:
+                ratio = max_w / p.width
+                p = p.resize(
+                    (max_w, max(1, int(p.height * ratio))),
+                    _PIL.LANCZOS,
+                )
+            sized.append(p)
+        total_h = sum(p.height for p in sized) + gap * (len(sized) - 1)
+        if total_h > 8000:
+            scale = 8000 / total_h
+            max_w = max(1, int(max_w * scale))
+            sized = [
+                p.resize(
+                    (max_w, max(1, int(p.height * scale))),
+                    _PIL.LANCZOS,
+                ) for p in sized
+            ]
+            total_h = sum(p.height for p in sized) + gap * (len(sized) - 1)
+        out = _PIL.new("RGB", (max_w, total_h), bg_color)
+        y = 0
+        for p in sized:
+            out.paste(p, (0, y))
+            y += p.height + gap
+        buf = _io.BytesIO()
+        out.save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
+    except Exception:
+        # 失敗時は1ページ目だけ返す
+        return pages[0]
+
+
 def get_display_image(filepath, ext):
     """ファイルをブラウザ表示用の画像バイトに変換"""
     if ext == '.pdf':
@@ -824,33 +881,42 @@ if phase == "upload":
                     except Exception:
                         pass
 
-                # 表示用画像（PDFも画像化）
-                disp_img = get_display_image(tmp_path, ext)
-                images.append(disp_img)
-
-                # 出納簿貼り付け用
-                if ext == '.pdf':
-                    xl_img = pdf_to_image_bytes(tmp_path, zoom=1.5)
-                else:
-                    xl_img = image_to_jpeg_bytes(tmp_path)
-                excel_images.append(xl_img)
-
-                # 複数ページPDFの2ページ目以降を補足扱いで取り込み
-                # （確認画面で全ページ見え、Excelにも同じ番号で全ページ貼られる）
+                # 表示用画像 + Excel貼付用画像 + 補足資料を構築
                 if ext == '.pdf':
                     try:
-                        _npages = pdf_page_count(tmp_path)
-                        if _npages > 1:
-                            _all_pages = pdf_to_image_bytes_all_pages(tmp_path, zoom=2.0)
-                            _rot_applied = int(data.get("_orient_deg") or 0)
-                            for _pb in _all_pages[1:]:
-                                if not _pb:
-                                    continue
-                                if _rot_applied:
-                                    _pb = _rotate_jpeg_bytes(_pb, _rot_applied)
-                                data.setdefault("supplements", []).append(_pb)
+                        _all_pages = pdf_to_image_bytes_all_pages(
+                            tmp_path, zoom=2.0
+                        )
+                        _rot_applied = int(data.get("_orient_deg") or 0)
+                        if _rot_applied:
+                            _all_pages = [
+                                _rotate_jpeg_bytes(p, _rot_applied) if p else p
+                                for p in _all_pages
+                            ]
                     except Exception:
-                        pass
+                        _all_pages = []
+                    # 表示用: 全ページを縦に連結（モーダルでも全ページ見える）
+                    if len(_all_pages) >= 1:
+                        disp_img = _combine_pages_vertically(_all_pages)
+                    else:
+                        disp_img = get_display_image(tmp_path, ext)
+                    # Excel貼付用（メイン画像 = 1ページ目）
+                    if _all_pages and _all_pages[0]:
+                        xl_img = _all_pages[0]
+                    else:
+                        xl_img = pdf_to_image_bytes(tmp_path, zoom=1.5)
+                    # 2ページ目以降は「PDFの追加ページ」として保持
+                    # （表示は連結画像で完結。Excel書き込み時にも同じNoで貼られる）
+                    # 補足資料(supplements)とは区別し、補足セクションには表示しない
+                    if len(_all_pages) > 1:
+                        data["_pdf_extra_pages"] = [
+                            _pb for _pb in _all_pages[1:] if _pb
+                        ]
+                else:
+                    disp_img = get_display_image(tmp_path, ext)
+                    xl_img = image_to_jpeg_bytes(tmp_path)
+                images.append(disp_img)
+                excel_images.append(xl_img)
 
             finally:
                 os.unlink(tmp_path)
@@ -1345,7 +1411,7 @@ elif phase == "review":
 # =========================================================
 elif phase == "order":
     import pandas as _pd
-    from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
+    from st_aggrid import AgGrid, GridOptionsBuilder, JsCode, GridUpdateMode
 
     # all_order_items: 既存(_type="existing") + 新規(_type="new")
     all_order_items = st.session_state.get("all_order_items", [])
@@ -1368,26 +1434,9 @@ elif phase == "order":
          "収入 − 支出", "📊", "primary"),
     ])
 
-    # アクションバー
-    with st.container(border=True):
-        ac1, ac2, ac3 = st.columns([3, 1, 1])
-        with ac1:
-            st.markdown("##### 📋 書き込み順番の確認・並び替え")
-            st.caption(
-                "🖱 No.列をつかんで上下にドラッグで並び替え。"
-                "☑️ 左端のチェックで複数行を選び、まとめてドラッグもできます。"
-                + ("　📂 既存データも含めて並び替え可能（書き込み時は全件を指定順で書き直し）" if ex_count > 0 else "")
-            )
-        with ac2:
-            if st.button("← 戻って編集", use_container_width=True):
-                st.session_state["phase"] = "review"
-                st.rerun()
-        with ac3:
-            if st.button("✅ Excelに書き込む", type="primary",
-                         use_container_width=True,
-                         disabled=(not all_order_items)):
-                st.session_state["phase"] = "writing"
-                st.rerun()
+    # トップアクションバー用プレースホルダ（後で back-fill する）
+    # ※ ボタンより先にAgGridのドラッグ結果を取り込む必要があるため、ボタン描画を後ろにずらす
+    _top_actions_slot = st.empty()
 
     if not all_order_items:
         st.warning("書き込むデータがありません")
@@ -1490,19 +1539,25 @@ elif phase == "order":
         # キーに「件数 + バージョン番号」を含める：order画面に新しく入る/件数が変わる
         # たびにAgGridを再マウントし、古い内部状態（並び順）を捨てる
         _grid_ver = st.session_state.get("_order_grid_version", 0)
+        # update_mode は MANUAL（再描画はボタンクリックなどに任せる）
+        # ※ 旧コードで使っていた "MODEL_CHANGED" は streamlit-aggrid v1.0+ に
+        #   存在しない（無効）ため、ドラッグ結果が拾えないバグの原因になっていた。
         grid_response = AgGrid(
             _df,
             gridOptions=grid_options,
             height=_height,
             width="100%",
             allow_unsafe_jscode=True,
-            update_mode="MODEL_CHANGED",
+            update_mode=GridUpdateMode.MANUAL,
             theme="balham",
             key=f"order_grid_v{_grid_ver}_n{len(items)}",
             reload_data=False,
         )
 
-        # ドラッグ後の新しい順序を取得して反映（安定IDベース）
+        # ドラッグ後の新しい順序を session_state に保存する（st.rerunは呼ばない）
+        # ※ 同じスクリプト実行内でこの後にアクションバーのボタンが描画される。
+        #   ここでrerunすると、ボタンクリックの取り込みが失敗するため、
+        #   ボタンクリック → このハンドラで最新順序を保存 → ボタンが発火、の流れにする。
         try:
             new_data = grid_response.get("data")
             if new_data is not None and len(new_data) == len(items):
@@ -1519,7 +1574,10 @@ elif phase == "order":
                     ]
                     if len(new_items) == len(items):
                         st.session_state["all_order_items"] = new_items
-                        st.rerun()
+                        # この後のボタン描画が「最新の順序」を見て動くように
+                        # ローカル変数も更新しておく
+                        items = new_items
+                        all_order_items = new_items
         except Exception:
             pass
 
@@ -1535,6 +1593,33 @@ elif phase == "order":
             'No.列をドラッグで並び替え／左端☑️で複数選択してまとめて移動</span>',
             unsafe_allow_html=True,
         )
+
+    # ===== トップアクションバーを back-fill =====
+    # （AgGridのドラッグ結果をsession_stateに保存してから描画する。
+    #   ボタンクリックでrerunした際、ハンドラが最新順序を取り込んでから
+    #   ボタンが発火する流れになり、ドラッグした順序がそのままExcelに反映される）
+    with _top_actions_slot.container():
+        with st.container(border=True):
+            ac1, ac2, ac3 = st.columns([3, 1, 1])
+            with ac1:
+                st.markdown("##### 📋 書き込み順番の確認・並び替え")
+                st.caption(
+                    "🖱 No.列をつかんで上下にドラッグで並び替え。"
+                    "☑️ 左端のチェックで複数行を選び、まとめてドラッグもできます。"
+                    + ("　📂 既存データも含めて並び替え可能（書き込み時は全件を指定順で書き直し）" if ex_count > 0 else "")
+                )
+            with ac2:
+                if st.button("← 戻って編集", use_container_width=True,
+                             key="order_back_top"):
+                    st.session_state["phase"] = "review"
+                    st.rerun()
+            with ac3:
+                if st.button("✅ Excelに書き込む", type="primary",
+                             use_container_width=True,
+                             key="order_write_top",
+                             disabled=(not all_order_items)):
+                    st.session_state["phase"] = "writing"
+                    st.rerun()
 
     # 下部にもう一度書き込みボタン
     if all_order_items:
