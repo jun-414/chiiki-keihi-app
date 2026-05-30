@@ -967,6 +967,13 @@ elif phase == "review":
                 all_order_items.sort(
                     key=lambda _r: (_r.get("date") or "9999-99-99")
                 )
+                # AgGrid並び替え用に安定ID（リランで変わらない一意な識別子）を付与
+                for _idx, _it in enumerate(all_order_items):
+                    _it["_stable_id"] = f"sid_{_idx}"
+                # AgGridを強制再マウント（古い内部状態を捨てる）
+                st.session_state["_order_grid_version"] = (
+                    st.session_state.get("_order_grid_version", 0) + 1
+                )
                 st.session_state["all_order_items"] = all_order_items
                 st.session_state["order_records"]   = new_items
                 st.session_state["phase"] = "order"
@@ -1320,6 +1327,13 @@ elif phase == "review":
             all_order_items.sort(
                 key=lambda _r: (_r.get("date") or "9999-99-99")
             )
+            # AgGrid並び替え用に安定ID（リランで変わらない一意な識別子）を付与
+            for _idx2, _it2 in enumerate(all_order_items):
+                _it2["_stable_id"] = f"sid_{_idx2}"
+            # AgGridを強制再マウント
+            st.session_state["_order_grid_version"] = (
+                st.session_state.get("_order_grid_version", 0) + 1
+            )
             st.session_state["all_order_items"] = all_order_items
             st.session_state["order_records"]   = new_items
             st.session_state["phase"] = "order"
@@ -1380,6 +1394,10 @@ elif phase == "order":
     else:
         # ===== 出納簿風プレビュー（AgGrid: ドラッグで並び替え） =====
         items = st.session_state.get("all_order_items", all_order_items)
+        # 安全策: 安定IDが付いていないアイテムにはここで付与（外部経路から来た場合に備え）
+        for _i_chk, _it_chk in enumerate(items):
+            if not _it_chk.get("_stable_id"):
+                _it_chk["_stable_id"] = f"sid_init_{_i_chk}"
         _rows = []
         for i, r in enumerate(items):
             ds = r.get("date", "")
@@ -1391,7 +1409,7 @@ elif phase == "order":
             _kind = r.get("_kind", "expense")
             _amt  = int(r.get("amount", 0) or 0)
             _rows.append({
-                "_idx":   i,                                # 内部識別用
+                "_sid":   str(r.get("_stable_id")),         # 安定ID（並び替え追跡用）
                 "_type":  r.get("_type", "new"),            # 行色分け用
                 "_kind":  _kind,                            # 列値振り分け用
                 "種別":   "💰 収入" if _kind == "income" else "💴 支出",
@@ -1436,7 +1454,7 @@ elif phase == "order":
             filter=False, suppressMenu=True,
         )
         # 内部列は非表示
-        gb.configure_column("_idx",  hide=True)
+        gb.configure_column("_sid",  hide=True)
         gb.configure_column("_type", hide=True)
         gb.configure_column("_kind", hide=True)
         # 表示列（No.列にチェックボックス＋ドラッグハンドルを同居）
@@ -1469,6 +1487,9 @@ elif phase == "order":
         grid_options = gb.build()
 
         _height = min(620, 80 + len(_rows) * 34)
+        # キーに「件数 + バージョン番号」を含める：order画面に新しく入る/件数が変わる
+        # たびにAgGridを再マウントし、古い内部状態（並び順）を捨てる
+        _grid_ver = st.session_state.get("_order_grid_version", 0)
         grid_response = AgGrid(
             _df,
             gridOptions=grid_options,
@@ -1477,19 +1498,28 @@ elif phase == "order":
             allow_unsafe_jscode=True,
             update_mode="MODEL_CHANGED",
             theme="balham",
-            key=f"order_grid_{len(items)}",  # 件数が変わったら再生成
+            key=f"order_grid_v{_grid_ver}_n{len(items)}",
             reload_data=False,
         )
 
-        # ドラッグ後の新しい順序を取得して反映
+        # ドラッグ後の新しい順序を取得して反映（安定IDベース）
         try:
             new_data = grid_response.get("data")
             if new_data is not None and len(new_data) == len(items):
-                new_order_idx = [int(x) for x in new_data["_idx"].tolist()]
-                if new_order_idx != list(range(len(items))):
-                    new_items = [items[i] for i in new_order_idx]
-                    st.session_state["all_order_items"] = new_items
-                    st.rerun()
+                new_sid_order = [str(x) for x in new_data["_sid"].tolist()]
+                current_sid_order = [str(r.get("_stable_id", "")) for r in items]
+                if new_sid_order != current_sid_order:
+                    sid_to_item = {
+                        str(r.get("_stable_id", "")): r for r in items
+                    }
+                    new_items = [
+                        sid_to_item[sid]
+                        for sid in new_sid_order
+                        if sid in sid_to_item
+                    ]
+                    if len(new_items) == len(items):
+                        st.session_state["all_order_items"] = new_items
+                        st.rerun()
         except Exception:
             pass
 
@@ -1538,7 +1568,7 @@ elif phase == "writing":
 
             # 書き込み用レコード（内部管理フィールドの一部を除去、_typeは残す）
             _drop_keys = {"_confirmed", "_ocr_engine", "_ai_error", "_fx_info",
-                          "warning", "_orig_idx"}
+                          "warning", "_orig_idx", "_stable_id"}
             write_records = [
                 {k: v for k, v in r.items() if k not in _drop_keys}
                 for r in all_order_items
@@ -1557,7 +1587,7 @@ elif phase == "writing":
             order_records = st.session_state.get("order_records", [])
             rewrite_all   = False
             _drop_keys    = {"_confirmed", "_ocr_engine", "_ai_error", "_fx_info",
-                             "warning", "_orig_idx", "_type"}
+                             "warning", "_orig_idx", "_type", "_stable_id"}
             write_records = [
                 {k: v for k, v in r.items() if k not in _drop_keys}
                 for r in order_records
