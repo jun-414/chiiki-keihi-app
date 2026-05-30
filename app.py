@@ -18,7 +18,10 @@ _PAGE_ICON = _PILImage.open(_FAVICON_PATH) if os.path.exists(_FAVICON_PATH) else
 from core.extract import (
     extract_from_file,
     pdf_to_image_bytes,
+    pdf_to_image_bytes_all_pages,
+    pdf_page_count,
     image_to_jpeg_bytes,
+    _rotate_jpeg_bytes,
     KAMOKU_OPTIONS,
     JIGYO_OPTIONS,
 )
@@ -832,6 +835,23 @@ if phase == "upload":
                     xl_img = image_to_jpeg_bytes(tmp_path)
                 excel_images.append(xl_img)
 
+                # 複数ページPDFの2ページ目以降を補足扱いで取り込み
+                # （確認画面で全ページ見え、Excelにも同じ番号で全ページ貼られる）
+                if ext == '.pdf':
+                    try:
+                        _npages = pdf_page_count(tmp_path)
+                        if _npages > 1:
+                            _all_pages = pdf_to_image_bytes_all_pages(tmp_path, zoom=2.0)
+                            _rot_applied = int(data.get("_orient_deg") or 0)
+                            for _pb in _all_pages[1:]:
+                                if not _pb:
+                                    continue
+                                if _rot_applied:
+                                    _pb = _rotate_jpeg_bytes(_pb, _rot_applied)
+                                data.setdefault("supplements", []).append(_pb)
+                    except Exception:
+                        pass
+
             finally:
                 os.unlink(tmp_path)
 
@@ -942,6 +962,11 @@ elif phase == "review":
                         st.session_state.get("denpyo_bytes", b"")
                     )
                 all_order_items = existing_items + new_items
+                # 確認・編集で日付を変えた内容がそのまま順番に反映されるよう、
+                # 順番調整画面に入る直前に日付の古い順で並べ替える
+                all_order_items.sort(
+                    key=lambda _r: (_r.get("date") or "9999-99-99")
+                )
                 st.session_state["all_order_items"] = all_order_items
                 st.session_state["order_records"]   = new_items
                 st.session_state["phase"] = "order"
@@ -1290,6 +1315,11 @@ elif phase == "review":
                     st.session_state.get("denpyo_bytes", b"")
                 )
             all_order_items = existing_items + new_items
+            # 確認・編集で日付を変えた内容がそのまま順番に反映されるよう、
+            # 順番調整画面に入る直前に日付の古い順で並べ替える
+            all_order_items.sort(
+                key=lambda _r: (_r.get("date") or "9999-99-99")
+            )
             st.session_state["all_order_items"] = all_order_items
             st.session_state["order_records"]   = new_items
             st.session_state["phase"] = "order"

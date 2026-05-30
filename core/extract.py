@@ -794,6 +794,32 @@ def pdf_to_image_bytes(filepath: str, zoom: float = 2.0) -> bytes:
         return None
 
 
+def pdf_to_image_bytes_all_pages(filepath: str, zoom: float = 2.0) -> list:
+    """PDFの全ページをJPEG画像バイトのリストにして返す。失敗時は空リスト。"""
+    try:
+        import fitz
+        doc = fitz.open(filepath)
+        out = []
+        for page in doc:
+            try:
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                out.append(pix.tobytes("jpeg"))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def pdf_page_count(filepath: str) -> int:
+    """PDFのページ数を返す。失敗時は0。"""
+    try:
+        import fitz
+        return len(fitz.open(filepath))
+    except Exception:
+        return 0
+
+
 def image_to_jpeg_bytes(filepath: str) -> bytes:
     """画像ファイルをJPEGバイト列に変換（EXIFの回転情報を反映して正立させる）"""
     try:
@@ -999,11 +1025,13 @@ def extract_from_file(filepath: str, filename: str = None,
     # デジタルPDF（pdfplumberでクリーンな水平テキストが取れている）は正立確実なので
     # 向き判定の余計なAPI呼び出しをスキップする。
     _is_digital_pdf = bool(text)
+    _orient_deg = 0  # 適用した回転角（複数ページPDFの2ページ目以降にも同じ角度を適用するため保持）
     if vision_img_bytes and ai_api_key and not _is_digital_pdf:
         try:
             _rot = detect_upright_rotation(vision_img_bytes, ai_api_key, ai_provider)
             if _rot:
                 vision_img_bytes = _rotate_jpeg_bytes(vision_img_bytes, _rot)
+                _orient_deg = _rot
         except Exception:
             pass
 
@@ -1112,4 +1140,5 @@ def extract_from_file(filepath: str, filename: str = None,
         "_currency":   currency,
         "_ai_error":   ai_error,  # AIエラー詳細（診断用）
         "_ai_usage":   ai_usage,  # {provider, model, input_tokens, output_tokens} or None
+        "_orient_deg": _orient_deg,  # 1ページ目に適用した回転角（複数ページPDFの2ページ目以降用）
     }
