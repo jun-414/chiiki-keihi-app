@@ -407,6 +407,115 @@ def _count_existing_image_slots(ws) -> int:
     return count
 
 
+def _parse_no_label(text: str):
+    """ 'No.5' / 'No.5-1' / 'No. 12 ' 等から整数Noを返す。失敗時None。"""
+    if not isinstance(text, str):
+        return None
+    s = text.strip()
+    if not s.startswith("No."):
+        return None
+    rest = s[3:].strip().split("-")[0].split(".")[0].split(" ")[0]
+    try:
+        return int(rest)
+    except (ValueError, TypeError):
+        return None
+
+
+def extract_receipt_sheet_images(ws_receipt) -> dict:
+    """
+    領収書シートから既存画像を取り出し、{old_no: [img_bytes, ...]} で返す。
+
+    各画像はアンカー位置から最寄りの "No.X" ラベル（同列または近接列で
+    画像より上にあるもの）に紐付ける。読めない画像はスキップする。
+    """
+    result: dict = {}
+    if not hasattr(ws_receipt, "_images") or not ws_receipt._images:
+        return result
+
+    # ラベル位置（row, col, no）を収集
+    labels = []
+    for row in ws_receipt.iter_rows():
+        for cell in row:
+            no = _parse_no_label(cell.value)
+            if no is not None:
+                labels.append((cell.row, cell.column, no))
+    if not labels:
+        return result
+
+    # 各画像 → 最寄りラベルに紐付け
+    for img in list(ws_receipt._images):
+        try:
+            # 画像バイトを取り出す（openpyxlのバージョン差を吸収）
+            data = None
+            try:
+                d = img._data
+                data = d() if callable(d) else d
+            except Exception:
+                data = None
+            if not data and hasattr(img, "ref"):
+                ref = img.ref
+                if hasattr(ref, "read"):
+                    try:
+                        ref.seek(0)
+                    except Exception:
+                        pass
+                    data = ref.read()
+                elif hasattr(ref, "getvalue"):
+                    data = ref.getvalue()
+            if not data:
+                continue
+
+            # アンカー位置 → (row, col) (1-based)
+            anchor = getattr(img, "anchor", None)
+            ar, ac = None, None
+            if anchor is not None and hasattr(anchor, "_from") and anchor._from is not None:
+                ar = anchor._from.row + 1
+                ac = anchor._from.col + 1
+            elif isinstance(anchor, str):
+                # "A2" のような文字列
+                from openpyxl.utils.cell import coordinate_from_string, column_index_from_string
+                col_str, row_num = coordinate_from_string(anchor)
+                ar = int(row_num)
+                ac = column_index_from_string(col_str)
+            if ar is None or ac is None:
+                continue
+
+            # 同列または ±2列以内で、画像より上にある最も近いラベル
+            best, best_d = None, None
+            for lr, lc, n in labels:
+                if abs(lc - ac) <= 2 and lr <= ar:
+                    # 行距離優先、列ズレに大きいペナルティ
+                    d = (ar - lr) + abs(lc - ac) * 100
+                    if best_d is None or d < best_d:
+                        best, best_d = n, d
+            if best is not None:
+                result.setdefault(best, []).append(data)
+        except Exception:
+            continue
+    return result
+
+
+def clear_receipt_sheet_contents(ws_receipt):
+    """
+    領収書シートの画像と No.X ラベルを全てクリアする（再配置の前準備）。
+    レイアウト関連のセル書式は触らない。
+    """
+    # 画像をクリア
+    try:
+        ws_receipt._images = []
+    except Exception:
+        pass
+    # "No.X" ラベルのセル値だけを消す
+    LEFT_COL_NUM = 1
+    RIGHT_COL_NUM = 7
+    max_row = ws_receipt.max_row or 1
+    for row_num in range(1, max_row + 2):
+        for col_num in (LEFT_COL_NUM, RIGHT_COL_NUM):
+            val = ws_receipt.cell(row=row_num, column=col_num).value
+            if isinstance(val, str) and val.strip().startswith("No."):
+                ws_receipt.cell(row=row_num, column=col_num).value = None
+
+
 def add_receipt_images_to_sheet(ws, images: list):
     """
     領収書シートにレシート画像を貼り付ける。
@@ -582,53 +691,92 @@ def write_receipts_to_excel(
 
     ws_d = wb["出納簿"]
     results = []
-    added_images = []
+    # all_no_images: [(new_no, sub_idx, img_bytes), ...]
+    #   sub_idx: 同じNo内の並び (0=メイン画像, 1,2,...=補足資料)
+    all_no_images = []
+
+    # 領収書シートの「対象」を決める（rewrite_all時にここから既存画像を抽出する）
+    target_receipt_sheet_name = None
+    if receipt_sheet_option == "auto":
+        target_receipt_sheet_name = next(
+            (n for n in wb.sheetnames if "領収書" in n), None
+        )
+    elif receipt_sheet_option != "new" and receipt_sheet_option in wb.sheetnames:
+        target_receipt_sheet_name = receipt_sheet_option
 
     if rewrite_all:
         # ===== 全書き直しモード =====
-        # 1. 全データ行をクリア
+        # 0) 既存の領収書シート画像を {old_no: [bytes...]} で取り出す
+        existing_images_by_old_no = {}
+        if target_receipt_sheet_name and target_receipt_sheet_name in wb.sheetnames:
+            try:
+                existing_images_by_old_no = extract_receipt_sheet_images(
+                    wb[target_receipt_sheet_name]
+                )
+            except Exception:
+                existing_images_by_old_no = {}
+
+        # 1) 出納簿の全データ行をクリア
         clear_data_rows(ws_d)
 
-        # 1.5 必要な行数ぶんスロットを確保（足りなければ罫線を継ぎ足し）
+        # 1.5) 必要な行数ぶんスロットを確保
         ensure_capacity(ws_d, len(records))
 
-        # 2. 新規アイテムの画像イテレータ
-        img_iter = iter(images)
+        # 2) 新規アイテムの画像イテレータ
+        new_img_iter = iter(images)
 
-        # 3. 全件を指定順で書き込む（重複チェックなし）
+        # 3) 全件を指定順で書き込み + 画像を「新しいNo」に紐付け
         for data in records:
             vendor = data.get("vendor", "不明")
             amount = data.get("amount", 0)
 
             target_row = find_first_empty_row(ws_d)
             write_single_row(ws_d, target_row, data)
-            no = ws_d.cell(row=target_row, column=1).value
+            new_no = ws_d.cell(row=target_row, column=1).value
 
             results.append({
-                "no": no,
+                "no": new_no,
                 "vendor": vendor,
                 "amount": amount,
                 "status": "追加",
                 "row": target_row,
             })
 
-            # 新規アイテムのみ画像を対応付け（_type="new"）
+            sub = 0
             if data.get("_type") == "new":
+                # メイン画像（input imagesから順次取り出し）
                 try:
-                    _, img_bytes = next(img_iter)
-                    if img_bytes:
-                        added_images.append((no, img_bytes))
+                    _, main_img = next(new_img_iter)
+                    if main_img and new_no is not None:
+                        all_no_images.append((new_no, sub, main_img))
+                        sub += 1
                 except StopIteration:
                     pass
+                # 補足資料（recordに保持）
+                for sb in (data.get("supplements") or []):
+                    if sb and new_no is not None:
+                        all_no_images.append((new_no, sub, sb))
+                        sub += 1
+            else:
+                # 既存レコード: old_no で既存領収書シートの画像を引き当てる
+                old_no = data.get("_old_no")
+                if old_no is not None:
+                    for sb in existing_images_by_old_no.get(old_no, []):
+                        if sb and new_no is not None:
+                            all_no_images.append((new_no, sub, sb))
+                            sub += 1
+                # 既存レコードに後付けで補足資料が付いていれば追加
+                for sb in (data.get("supplements") or []):
+                    if sb and new_no is not None:
+                        all_no_images.append((new_no, sub, sb))
+                        sub += 1
 
     else:
-        # ===== 通常モード（新規追加・重複チェックあり）=====
+        # ===== 通常モード（新規追加・重複チェックあり） =====
         sorted_records = records if skip_sort else sort_records_by_date(records)
-
-        # 必要な行数ぶんスロットを確保（足りなければ罫線を継ぎ足し）
         ensure_capacity(ws_d, len(sorted_records))
 
-        for data in sorted_records:
+        for idx, data in enumerate(sorted_records):
             vendor = data.get("vendor", "不明")
             amount = data.get("amount", 0)
             date_str = data.get("date", "")
@@ -644,13 +792,8 @@ def write_receipts_to_excel(
                 })
                 continue
 
-            # 書き込み先の空行を探す（74行超えた場合も自動追記）
             target_row = find_first_empty_row(ws_d)
-
-            # 書き込み実行
             write_single_row(ws_d, target_row, data)
-
-            # この行の№を取得（A列）
             no = ws_d.cell(row=target_row, column=1).value
 
             results.append({
@@ -661,14 +804,31 @@ def write_receipts_to_excel(
                 "row": target_row,
             })
 
-        # 通常モードの画像対応: results と images は同順・同数
-        added_images = [
-            (result["no"], img_bytes)
-            for result, (_, img_bytes) in zip(results, images)
-            if result["status"] == "追加" and result["no"] is not None
-        ]
+            sub = 0
+            # メイン画像（入力imagesは sorted_records と同順前提）
+            if idx < len(images):
+                _, main_img = images[idx]
+                if main_img and no is not None:
+                    all_no_images.append((no, sub, main_img))
+                    sub += 1
+            # 補足資料
+            for sb in (data.get("supplements") or []):
+                if sb and no is not None:
+                    all_no_images.append((no, sub, sb))
+                    sub += 1
 
-    # ===== 領収書シートへの画像貼り付け =====
+    # ===== 領収書シートへの画像貼り付け（昇順で再配置） =====
+    # No.昇順 + 同じNo内は サブidx順（メイン→補足1→補足2…）
+    def _sort_key(t):
+        no, sub, _ = t
+        try:
+            return (int(no), sub)
+        except (TypeError, ValueError):
+            return (10**9, sub)
+
+    all_no_images.sort(key=_sort_key)
+    added_images = [(no, b) for (no, _sub, b) in all_no_images]
+
     if added_images:
         if receipt_sheet_option == "auto":
             # 後方互換: 最初に見つかった「領収書」シートを使用
@@ -676,7 +836,16 @@ def write_receipts_to_excel(
                 (n for n in wb.sheetnames if "領収書" in n), "new"
             )
 
-        ws_r, _ = _get_or_create_receipt_sheet(wb, receipt_sheet_option, new_sheet_name)
+        if rewrite_all and target_receipt_sheet_name and \
+                target_receipt_sheet_name in wb.sheetnames:
+            # 既存シートを「ゼロから」再構築（画像とNoラベルを全消去してから貼り直し）
+            ws_r = wb[target_receipt_sheet_name]
+            clear_receipt_sheet_contents(ws_r)
+        else:
+            ws_r, _ = _get_or_create_receipt_sheet(
+                wb, receipt_sheet_option, new_sheet_name
+            )
+
         add_receipt_images_to_sheet(ws_r, added_images)
 
     # BytesIOに保存して返す

@@ -406,9 +406,16 @@ def read_existing_rows(excel_bytes: bytes) -> list:
                 if info:
                     font_info[col] = info
 
+            # 既存行のA列No.（領収書シート画像との突合に使う）
+            try:
+                _old_no = int(a) if isinstance(a, (int, float)) and a > 0 else None
+            except Exception:
+                _old_no = None
+
             rec = {
                 "_type":  "existing",
                 "_kind":  kind,
+                "_old_no": _old_no,
                 "date":   date_str,
                 "vendor": str(p or ""),
                 "memo":   str(k or ""),
@@ -1193,6 +1200,63 @@ elif phase == "review":
                             "_confirmed": True,
                         })
                         st.rerun()
+
+            # --- 補足資料セクション（領収書ごとに追加写真/PDFを添付） ---
+            _supps = st.session_state["records"][i].get("supplements", []) or []
+            st.markdown(
+                f"<div style='margin-top:0.6rem;font-size:0.9rem;font-weight:600;color:#3e4a6a'>"
+                f"📎 補足資料（{len(_supps)} 件）"
+                f"<span style='font-weight:400;color:#677291;font-size:0.78rem;margin-left:0.4rem'>"
+                f"— エクセルにも同じ番号で貼り付けられます</span></div>",
+                unsafe_allow_html=True,
+            )
+            # 既存の補足を一覧 + 個別削除
+            if _supps:
+                _scols = st.columns(min(4, len(_supps)))
+                for _si, _sb in enumerate(_supps):
+                    with _scols[_si % len(_scols)]:
+                        try:
+                            st.image(_sb, width=140)
+                        except Exception:
+                            st.caption("（画像表示不可）")
+                        if st.button("🗑 削除", key=f"del_supp_{i}_{_si}_{filename}",
+                                     use_container_width=True):
+                            st.session_state["records"][i]["supplements"].pop(_si)
+                            st.rerun()
+            # 新規追加フォーム（form内に file_uploader を入れて clear_on_submit で重複防止）
+            with st.form(f"supp_form_{i}_{filename}", clear_on_submit=True):
+                _new_supps = st.file_uploader(
+                    "補足資料を追加（画像・PDF / 複数可）",
+                    type=["pdf", "jpg", "jpeg", "png", "heic", "heif"],
+                    accept_multiple_files=True,
+                    key=f"supp_up_{i}_{filename}",
+                    label_visibility="collapsed",
+                )
+                _add_supp = st.form_submit_button(
+                    "➕ 補足資料を追加", use_container_width=True,
+                )
+            if _add_supp and _new_supps:
+                for _nf in _new_supps:
+                    _ext = os.path.splitext(_nf.name)[1].lower()
+                    _raw = _nf.read()
+                    with tempfile.NamedTemporaryFile(suffix=_ext, delete=False) as _tmp:
+                        _tmp.write(_raw)
+                        _tp = _tmp.name
+                    try:
+                        if _ext == '.pdf':
+                            _bb = pdf_to_image_bytes(_tp, zoom=1.5)
+                        else:
+                            _bb = image_to_jpeg_bytes(_tp)
+                    finally:
+                        try:
+                            os.unlink(_tp)
+                        except Exception:
+                            pass
+                    if _bb:
+                        st.session_state["records"][i].setdefault(
+                            "supplements", []
+                        ).append(_bb)
+                st.rerun()
 
     # --- ボトムアクションバー（スクロール後にも次へ進める） ---
     st.divider()
