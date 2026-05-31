@@ -160,17 +160,43 @@ def require_login() -> dict:
 # =========================================================
 # ヘルパー
 # =========================================================
-def _combine_pages_vertically(page_bytes_list, gap=24,
-                              bg_color=(245, 245, 245)):
+def _shrink_image_bytes(img_bytes, max_w=1000, max_h=2200, quality=72):
+    """画像を表示用の小さいJPEGに縮小（session_state肥大化対策）。"""
+    if not img_bytes:
+        return img_bytes
+    try:
+        from PIL import Image as _PIL
+        import io as _io
+        img = _PIL.open(_io.BytesIO(img_bytes)).convert("RGB")
+        w, h = img.size
+        scale = min(max_w / w, max_h / h, 1.0)
+        if scale < 1.0:
+            img = img.resize(
+                (max(1, int(w * scale)), max(1, int(h * scale))),
+                _PIL.LANCZOS,
+            )
+        buf = _io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        return buf.getvalue()
+    except Exception:
+        return img_bytes
+
+
+def _combine_pages_vertically(page_bytes_list, gap=16,
+                              bg_color=(245, 245, 245),
+                              target_width=900, max_total_height=3600,
+                              quality=70):
     """
     複数ページのJPEGバイト列を縦方向に連結して1枚のJPEGバイト列にする。
-    ページ幅は最も広いページに揃え、間に薄いグレー帯を入れて区切りを示す。
+    表示用なので解像度・画質を抑えてsession_state肥大化を防ぐ。
     """
     pages = [pb for pb in (page_bytes_list or []) if pb]
     if not pages:
         return None
     if len(pages) == 1:
-        return pages[0]
+        # 1枚なら縮小版だけ返す（オリジナルが巨大な場合の保険）
+        return _shrink_image_bytes(pages[0], max_w=target_width,
+                                   max_h=max_total_height, quality=quality)
     try:
         from PIL import Image as _PIL
         import io as _io
@@ -182,38 +208,38 @@ def _combine_pages_vertically(page_bytes_list, gap=24,
                 pass
         if not pils:
             return None
-        max_w = max(p.width for p in pils)
-        # 大きすぎる場合のメモリ対策（連結後の最大高さを 8000px に制限）
+        # まず全ページを target_width に揃える
         sized = []
         for p in pils:
-            if p.width != max_w:
-                ratio = max_w / p.width
+            if p.width != target_width:
+                ratio = target_width / p.width
                 p = p.resize(
-                    (max_w, max(1, int(p.height * ratio))),
+                    (target_width, max(1, int(p.height * ratio))),
                     _PIL.LANCZOS,
                 )
             sized.append(p)
         total_h = sum(p.height for p in sized) + gap * (len(sized) - 1)
-        if total_h > 8000:
-            scale = 8000 / total_h
-            max_w = max(1, int(max_w * scale))
+        # 縦が長すぎたら全体を縮小
+        if total_h > max_total_height:
+            scale = max_total_height / total_h
+            new_w = max(1, int(target_width * scale))
             sized = [
                 p.resize(
-                    (max_w, max(1, int(p.height * scale))),
+                    (new_w, max(1, int(p.height * scale))),
                     _PIL.LANCZOS,
                 ) for p in sized
             ]
             total_h = sum(p.height for p in sized) + gap * (len(sized) - 1)
-        out = _PIL.new("RGB", (max_w, total_h), bg_color)
+            target_width = new_w
+        out = _PIL.new("RGB", (target_width, total_h), bg_color)
         y = 0
         for p in sized:
             out.paste(p, (0, y))
             y += p.height + gap
         buf = _io.BytesIO()
-        out.save(buf, format="JPEG", quality=85)
+        out.save(buf, format="JPEG", quality=quality, optimize=True)
         return buf.getvalue()
     except Exception:
-        # 失敗時は1ページ目だけ返す
         return pages[0]
 
 
@@ -884,8 +910,9 @@ if phase == "upload":
                 # 表示用画像 + Excel貼付用画像 + 補足資料を構築
                 if ext == '.pdf':
                     try:
+                        # zoom=1.5 で十分（Excel貼付・表示両用、メモリ節約）
                         _all_pages = pdf_to_image_bytes_all_pages(
-                            tmp_path, zoom=2.0
+                            tmp_path, zoom=1.5
                         )
                         _rot_applied = int(data.get("_orient_deg") or 0)
                         if _rot_applied:
@@ -895,11 +922,13 @@ if phase == "upload":
                             ]
                     except Exception:
                         _all_pages = []
-                    # 表示用: 全ページを縦に連結（モーダルでも全ページ見える）
+                    # 表示用: 全ページを縦に連結（モーダルでも全ページ見える・縮小済）
                     if len(_all_pages) >= 1:
                         disp_img = _combine_pages_vertically(_all_pages)
                     else:
-                        disp_img = get_display_image(tmp_path, ext)
+                        disp_img = _shrink_image_bytes(
+                            get_display_image(tmp_path, ext)
+                        )
                     # Excel貼付用（メイン画像 = 1ページ目）
                     if _all_pages and _all_pages[0]:
                         xl_img = _all_pages[0]
@@ -907,13 +936,15 @@ if phase == "upload":
                         xl_img = pdf_to_image_bytes(tmp_path, zoom=1.5)
                     # 2ページ目以降は「PDFの追加ページ」として保持
                     # （表示は連結画像で完結。Excel書き込み時にも同じNoで貼られる）
-                    # 補足資料(supplements)とは区別し、補足セクションには表示しない
                     if len(_all_pages) > 1:
                         data["_pdf_extra_pages"] = [
                             _pb for _pb in _all_pages[1:] if _pb
                         ]
                 else:
-                    disp_img = get_display_image(tmp_path, ext)
+                    # 写真は session_state 肥大化を避けるため表示用は縮小して保持
+                    disp_img = _shrink_image_bytes(
+                        get_display_image(tmp_path, ext)
+                    )
                     xl_img = image_to_jpeg_bytes(tmp_path)
                 images.append(disp_img)
                 excel_images.append(xl_img)
@@ -1351,6 +1382,9 @@ elif phase == "review":
                         except Exception:
                             pass
                     if _bb:
+                        # session_state肥大化を避けるため縮小して保持
+                        _bb = _shrink_image_bytes(_bb, max_w=1200,
+                                                  max_h=1600, quality=75)
                         st.session_state["records"][i].setdefault(
                             "supplements", []
                         ).append(_bb)
