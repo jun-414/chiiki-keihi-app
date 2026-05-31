@@ -1222,8 +1222,64 @@ elif phase == "review":
             st.session_state["receipt_new_sheet_name"] = ""
             st.caption(f"📝 「{_sel_sheet}」タブの続きに追記します")
 
-    # --- 各領収書のカード（日付順） ---
-    for i, (record, img_bytes, filename) in enumerate(zip(records, images, filenames)):
+    # --- ページネーション（領収書が多くてもブラウザを軽く保つため） ---
+    _PAGE_SIZE = 15
+    _total_n = len(records)
+    _total_pages = max(1, (_total_n + _PAGE_SIZE - 1) // _PAGE_SIZE)
+    _page = int(st.session_state.get("_review_page", 0))
+    # 件数が変動した場合のクランプ
+    if _page < 0 or _page >= _total_pages:
+        _page = 0
+        st.session_state["_review_page"] = 0
+    _start = _page * _PAGE_SIZE
+    _end = min(_start + _PAGE_SIZE, _total_n)
+
+    if _total_pages > 1:
+        with st.container(border=True):
+            _pcol1, _pcolmid, _pcol2, _pcol3 = st.columns([1, 3, 1, 1.5])
+            with _pcol1:
+                if st.button("◀ 前へ", use_container_width=True,
+                             disabled=(_page == 0), key="page_prev_top"):
+                    st.session_state["_review_page"] = _page - 1
+                    st.rerun()
+            with _pcolmid:
+                # このページ内の進捗
+                _page_recs = records[_start:_end]
+                _page_conf = sum(1 for r in _page_recs if r.get("_confirmed"))
+                st.markdown(
+                    f"<div style='text-align:center;line-height:2.4;"
+                    f"font-weight:600;color:#3e4a6a;'>"
+                    f"ページ <b>{_page+1}</b> / {_total_pages}　"
+                    f"<span style='color:#677291;font-weight:500;'>"
+                    f"（{_start+1}〜{_end} / {_total_n} 件　・"
+                    f"このページの確定 {_page_conf}/{len(_page_recs)}）</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            with _pcol2:
+                if st.button("次へ ▶", use_container_width=True,
+                             disabled=(_page >= _total_pages - 1),
+                             key="page_next_top"):
+                    st.session_state["_review_page"] = _page + 1
+                    st.rerun()
+            with _pcol3:
+                _jump = st.selectbox(
+                    "ページへ移動",
+                    list(range(1, _total_pages + 1)),
+                    index=_page,
+                    format_func=lambda x: f"P.{x}",
+                    key="page_jump_top",
+                    label_visibility="collapsed",
+                )
+                if _jump - 1 != _page:
+                    st.session_state["_review_page"] = _jump - 1
+                    st.rerun()
+
+    # --- 各領収書のカード（このページ分のみ表示） ---
+    for i in range(_start, _end):
+        record = records[i]
+        img_bytes = images[i] if i < len(images) else None
+        filename = filenames[i] if i < len(filenames) else ""
         confirmed = record.get("_confirmed", False)
         amount    = int(record.get("amount", 0))
         vendor    = record.get("vendor", "不明")
@@ -1452,6 +1508,30 @@ elif phase == "review":
                             "supplements", []
                         ).append(_bb)
                 st.rerun()
+
+    # --- 下部のページ送り（カード末尾でも操作しやすくする） ---
+    if _total_pages > 1:
+        with st.container(border=True):
+            _pb1, _pbmid, _pb2 = st.columns([1, 3, 1])
+            with _pb1:
+                if st.button("◀ 前のページへ", use_container_width=True,
+                             disabled=(_page == 0), key="page_prev_bottom"):
+                    st.session_state["_review_page"] = _page - 1
+                    st.rerun()
+            with _pbmid:
+                st.markdown(
+                    f"<div style='text-align:center;line-height:2.4;"
+                    f"font-weight:600;color:#3e4a6a;'>"
+                    f"ページ <b>{_page+1}</b> / {_total_pages}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            with _pb2:
+                if st.button("次のページへ ▶", use_container_width=True,
+                             disabled=(_page >= _total_pages - 1),
+                             key="page_next_bottom"):
+                    st.session_state["_review_page"] = _page + 1
+                    st.rerun()
 
     # --- ボトムアクションバー（スクロール後にも次へ進める） ---
     st.divider()
@@ -1911,6 +1991,7 @@ elif phase == "done":
                 "all_order_items": [], "order_records": [],
                 "result_bytes": None, "write_results": [],
                 "_order_visited_once": False,
+                "_review_page": 0,
                 "phase": "upload",
             })
             st.rerun()
