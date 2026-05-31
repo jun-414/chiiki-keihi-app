@@ -889,8 +889,124 @@ def write_receipts_to_excel(
 
         add_receipt_images_to_sheet(ws_r, added_images)
 
-    # BytesIOに保存して返す
+    # BytesIOに保存
     output = BytesIO()
     wb.save(output)
     output.seek(0)
-    return output.read(), results
+    xlsx_bytes = output.read()
+
+    # 出力後にdrawing関係の整合性を修復する（openpyxlのバージョン差や内部状態の
+    # 不整合で発生する Excel「内容に問題が見つかりました」エラーの根本対策）
+    xlsx_bytes = _repair_drawing_consistency(xlsx_bytes)
+
+    # 仕上げに「openpyxlでもう一度読み込んでそのまま再保存」する。
+    # これで wb._archive に残ってしまった不整合な中間状態（古いrels・古い
+    # drawing要素・余分なオーバーライド等）が一掃される。
+    # この round-trip は壊れたxlsxを直す効果が高く、Excelの「内容に問題」
+    # 警告に対する強力な保険として働く。
+    try:
+        import openpyxl as _xl
+        _wb2 = _xl.load_workbook(BytesIO(xlsx_bytes))
+        _buf2 = BytesIO()
+        _wb2.save(_buf2)
+        _buf2.seek(0)
+        xlsx_bytes = _buf2.read()
+        # round-trip後にも drawing 整合性を念のため再確認
+        xlsx_bytes = _repair_drawing_consistency(xlsx_bytes)
+    except Exception:
+        # round-tripに失敗しても元の出力は返す
+        pass
+
+    return xlsx_bytes, results
+
+
+def _repair_drawing_consistency(xlsx_bytes: bytes) -> bytes:
+    """
+    出力xlsxを点検し、シート本体の <drawing> 要素と rels の drawing 関係が
+    不整合な場合（rels はあるのに本体に要素がない、またはその逆）を修復する。
+
+    openpyxl で load → ws._images の操作 → save をすると、まれに
+    sheet本体の <drawing r:id="..."/> 要素だけが落ち、rels側だけが残った
+    状態の xlsx を出力してしまうことがある。この状態は Excel が
+    「内容に問題が見つかりました」と判定する典型例。
+
+    後処理として zip 内部を直接書き換えて整合性を取り、Excel が確実に
+    警告なく開ける形に修復する。
+    """
+    import zipfile as _zf
+    import re as _re
+    try:
+        zf_in = _zf.ZipFile(BytesIO(xlsx_bytes))
+        names = zf_in.namelist()
+    except Exception:
+        return xlsx_bytes
+
+    edits = {}  # name -> new_content (str)
+
+    for sheet_name in names:
+        if not (sheet_name.startswith("xl/worksheets/sheet")
+                and sheet_name.endswith(".xml")):
+            continue
+        rels_name = (sheet_name.replace("xl/worksheets/", "xl/worksheets/_rels/")
+                     + ".rels")
+        if rels_name not in names:
+            continue
+        try:
+            sheet_xml = zf_in.read(sheet_name).decode("utf-8", errors="ignore")
+            rels_xml  = zf_in.read(rels_name).decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        # rels に登録されている drawing 関係を取得
+        drawing_rel_id = None
+        m = _re.search(
+            r'<Relationship\s+[^>]*Type="[^"]*relationships/drawing"'
+            r'[^>]*Id="([^"]+)"',
+            rels_xml,
+        )
+        if m:
+            drawing_rel_id = m.group(1)
+        else:
+            m2 = _re.search(
+                r'<Relationship\s+[^>]*Id="([^"]+)"'
+                r'[^>]*Type="[^"]*relationships/drawing"',
+                rels_xml,
+            )
+            if m2:
+                drawing_rel_id = m2.group(1)
+
+        body_has_drawing = bool(
+            _re.search(r'<drawing\b[^/]*/>', sheet_xml)
+            or _re.search(r'<drawing\b[^>]*>', sheet_xml)
+        )
+
+        if drawing_rel_id and not body_has_drawing:
+            # rels はあるのに sheet本体に <drawing> が無い → 注入して修復
+            insertion = f'<drawing r:id="{drawing_rel_id}"/>'
+            # </worksheet> の直前に入れる
+            if "</worksheet>" in sheet_xml:
+                fixed = sheet_xml.replace(
+                    "</worksheet>", insertion + "</worksheet>", 1
+                )
+                edits[sheet_name] = fixed
+        elif body_has_drawing and not drawing_rel_id:
+            # 本体に <drawing> があるのに rels に対応する Relationship が無い
+            # → 孤立した <drawing> を削除
+            fixed = _re.sub(r'<drawing\b[^/]*/>', '', sheet_xml)
+            fixed = _re.sub(r'<drawing\b[^>]*></drawing>', '', fixed)
+            edits[sheet_name] = fixed
+
+    if not edits:
+        return xlsx_bytes
+
+    out_buf = BytesIO()
+    zf_out = _zf.ZipFile(out_buf, "w", _zf.ZIP_DEFLATED)
+    try:
+        for name in names:
+            if name in edits:
+                zf_out.writestr(name, edits[name])
+            else:
+                zf_out.writestr(name, zf_in.read(name))
+    finally:
+        zf_out.close()
+    return out_buf.getvalue()
