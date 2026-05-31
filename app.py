@@ -243,6 +243,70 @@ def _combine_pages_vertically(page_bytes_list, gap=16,
         return pages[0]
 
 
+def _build_order_items_preserving_manual(existing_items, new_items_now):
+    """
+    review→order 移行時に渡すべき all_order_items を作る。
+
+    - 初回（既存のorder情報がない）: 全件を日付の古い順でソート
+    - 2回目以降: 前回の手動並び替え順を保ったまま、追加・削除・編集を反映
+        - 削除された行は除外
+        - 編集された行（新規分は _orig_idx、既存分は _old_no をキーに突合）はデータ更新
+        - 新しく追加された行は末尾に日付順で追加
+    これにより「並び替え→戻る→編集→再入場」しても手動順序が壊れない。
+    """
+    prev = st.session_state.get("all_order_items") or []
+    visited = bool(st.session_state.get("_order_visited_once", False))
+
+    if not prev or not visited:
+        merged = list(existing_items) + list(new_items_now)
+        merged.sort(key=lambda r: r.get("date") or "9999-99-99")
+        return merged
+
+    # 突合用インデックス
+    new_by_idx = {nr.get("_orig_idx"): nr for nr in new_items_now}
+    existing_by_oldno = {er.get("_old_no"): er for er in existing_items}
+
+    merged = []
+    used_new = set()
+    used_old = set()
+    for r in prev:
+        t = r.get("_type")
+        if t == "new":
+            oi = r.get("_orig_idx")
+            if oi in new_by_idx:
+                latest = new_by_idx[oi]
+                # 元の順序を保ちつつ、編集後のフィールドを最新化（_stable_idは維持）
+                merged_row = {**r, **{k: v for k, v in latest.items()
+                                      if k != "_stable_id"}}
+                merged.append(merged_row)
+                used_new.add(oi)
+            # 見つからない＝削除された行 → 除外
+        elif t == "existing":
+            on = r.get("_old_no")
+            if on in existing_by_oldno:
+                latest = existing_by_oldno[on]
+                merged_row = {**r, **{k: v for k, v in latest.items()
+                                      if k != "_stable_id"}}
+                merged.append(merged_row)
+                used_old.add(on)
+        else:
+            # 不明な型はそのまま保持
+            merged.append(r)
+
+    # 新規追加された行（前回時点に居なかった）を末尾に日付順で
+    appended_new = [nr for oi, nr in new_by_idx.items() if oi not in used_new]
+    appended_new.sort(key=lambda r: r.get("date") or "9999-99-99")
+    merged.extend(appended_new)
+
+    # まれに既存に新顔が増えるケース（通常ありえないが念のため）
+    appended_existing = [er for on, er in existing_by_oldno.items()
+                         if on not in used_old]
+    appended_existing.sort(key=lambda r: r.get("date") or "9999-99-99")
+    merged.extend(appended_existing)
+
+    return merged
+
+
 def get_display_image(filepath, ext):
     """ファイルをブラウザ表示用の画像バイトに変換"""
     if ext == '.pdf':
@@ -1058,13 +1122,11 @@ elif phase == "review":
                     existing_items = read_existing_rows(
                         st.session_state.get("denpyo_bytes", b"")
                     )
-                all_order_items = existing_items + new_items
-                # 確認・編集で日付を変えた内容がそのまま順番に反映されるよう、
-                # 順番調整画面に入る直前に日付の古い順で並べ替える
-                all_order_items.sort(
-                    key=lambda _r: (_r.get("date") or "9999-99-99")
+                # 過去に手動並び替えしていればその順を保ち、初回のみ日付順に整列する
+                all_order_items = _build_order_items_preserving_manual(
+                    existing_items, new_items
                 )
-                # AgGrid並び替え用に安定ID（リランで変わらない一意な識別子）を付与
+                # AgGrid並び替え用に安定ID（リランで変わらない一意な識別子）を再付与
                 for _idx, _it in enumerate(all_order_items):
                     _it["_stable_id"] = f"sid_{_idx}"
                 # AgGridを強制再マウント（古い内部状態を捨てる）
@@ -1073,6 +1135,7 @@ elif phase == "review":
                 )
                 st.session_state["all_order_items"] = all_order_items
                 st.session_state["order_records"]   = new_items
+                st.session_state["_order_visited_once"] = True
                 st.session_state["phase"] = "order"
                 st.rerun()
 
@@ -1421,13 +1484,11 @@ elif phase == "review":
                 existing_items = read_existing_rows(
                     st.session_state.get("denpyo_bytes", b"")
                 )
-            all_order_items = existing_items + new_items
-            # 確認・編集で日付を変えた内容がそのまま順番に反映されるよう、
-            # 順番調整画面に入る直前に日付の古い順で並べ替える
-            all_order_items.sort(
-                key=lambda _r: (_r.get("date") or "9999-99-99")
+            # 過去に手動並び替えしていればその順を保ち、初回のみ日付順に整列する
+            all_order_items = _build_order_items_preserving_manual(
+                existing_items, new_items
             )
-            # AgGrid並び替え用に安定ID（リランで変わらない一意な識別子）を付与
+            # AgGrid並び替え用に安定ID（リランで変わらない一意な識別子）を再付与
             for _idx2, _it2 in enumerate(all_order_items):
                 _it2["_stable_id"] = f"sid_{_idx2}"
             # AgGridを強制再マウント
@@ -1436,6 +1497,7 @@ elif phase == "review":
             )
             st.session_state["all_order_items"] = all_order_items
             st.session_state["order_records"]   = new_items
+            st.session_state["_order_visited_once"] = True
             st.session_state["phase"] = "order"
             st.rerun()
 
@@ -1445,7 +1507,10 @@ elif phase == "review":
 # =========================================================
 elif phase == "order":
     import pandas as _pd
-    from st_aggrid import AgGrid, GridOptionsBuilder, JsCode, GridUpdateMode
+    from st_aggrid import (
+        AgGrid, GridOptionsBuilder, JsCode,
+        GridUpdateMode, DataReturnMode,
+    )
 
     # all_order_items: 既存(_type="existing") + 新規(_type="new")
     all_order_items = st.session_state.get("all_order_items", [])
@@ -1555,11 +1620,16 @@ elif phase == "order":
         gb.configure_column("支出", width=110, type=["numericColumn"],
                             valueFormatter=amount_formatter,
                             cellStyle={"color": "#8a4708", "fontWeight": "600"})
+        # 各行に _sid を一意IDとして割り当て、ドラッグ後の順序を確実に取得する
+        get_row_id_js = JsCode(
+            "function(params) { return String(params.data._sid); }"
+        )
         gb.configure_grid_options(
+            getRowId=get_row_id_js,           # ★ ドラッグ後の順序取得に必須
             rowDragManaged=True,
-            rowDragMultiRow=True,        # 複数選択した行をまとめてドラッグ
-            rowSelection="multiple",     # 複数行選択を許可
-            suppressRowClickSelection=True,  # 選択はチェックボックスのみ（誤選択防止）
+            rowDragMultiRow=True,             # 複数選択した行をまとめてドラッグ
+            rowSelection="multiple",          # 複数行選択を許可
+            suppressRowClickSelection=True,   # 選択はチェックボックスのみ（誤選択防止）
             animateRows=True,
             getRowStyle=row_style_js,
             domLayout='normal',
@@ -1570,12 +1640,10 @@ elif phase == "order":
         grid_options = gb.build()
 
         _height = min(620, 80 + len(_rows) * 34)
-        # キーに「件数 + バージョン番号」を含める：order画面に新しく入る/件数が変わる
-        # たびにAgGridを再マウントし、古い内部状態（並び順）を捨てる
         _grid_ver = st.session_state.get("_order_grid_version", 0)
-        # update_mode は MANUAL（再描画はボタンクリックなどに任せる）
-        # ※ 旧コードで使っていた "MODEL_CHANGED" は streamlit-aggrid v1.0+ に
-        #   存在しない（無効）ため、ドラッグ結果が拾えないバグの原因になっていた。
+        # update_mode=MANUAL: ドラッグでは自動rerunを発火させない。
+        # data_return_mode=FILTERED_AND_SORTED: data 属性に現在のグリッド表示順を反映。
+        # ※ デフォルト(AS_INPUT)では入力データそのままを返すため、ドラッグ結果が拾えない。
         grid_response = AgGrid(
             _df,
             gridOptions=grid_options,
@@ -1583,19 +1651,41 @@ elif phase == "order":
             width="100%",
             allow_unsafe_jscode=True,
             update_mode=GridUpdateMode.MANUAL,
+            data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
             theme="balham",
             key=f"order_grid_v{_grid_ver}_n{len(items)}",
             reload_data=False,
         )
 
-        # ドラッグ後の新しい順序を session_state に保存する（st.rerunは呼ばない）
-        # ※ 同じスクリプト実行内でこの後にアクションバーのボタンが描画される。
-        #   ここでrerunすると、ボタンクリックの取り込みが失敗するため、
-        #   ボタンクリック → このハンドラで最新順序を保存 → ボタンが発火、の流れにする。
+        # ドラッグ後の新しい順序を取得して session_state に保存する（st.rerunは呼ばない）
+        # 優先順位:
+        #  1. rows_id_after_sort_and_filter（getRowId経由の _sid リスト・最も信頼できる）
+        #  2. grid_response.data の _sid 列（FILTERED_AND_SORTED時に並び順反映）
         try:
-            new_data = grid_response.get("data")
-            if new_data is not None and len(new_data) == len(items):
-                new_sid_order = [str(x) for x in new_data["_sid"].tolist()]
+            new_sid_order = None
+            # ① rows_id_after_sort_and_filter （ag-gridの最新の行ID並び）
+            try:
+                row_ids = getattr(grid_response, "rows_id_after_sort_and_filter", None)
+                if row_ids:
+                    cand = [str(x) for x in row_ids]
+                    if len(cand) == len(items):
+                        new_sid_order = cand
+            except Exception:
+                pass
+            # ② data 属性のフォールバック
+            if new_sid_order is None:
+                nd = None
+                try:
+                    nd = grid_response.data
+                except Exception:
+                    try:
+                        nd = grid_response.get("data")
+                    except Exception:
+                        nd = None
+                if nd is not None and len(nd) == len(items):
+                    new_sid_order = [str(x) for x in nd["_sid"].tolist()]
+
+            if new_sid_order is not None and len(new_sid_order) == len(items):
                 current_sid_order = [str(r.get("_stable_id", "")) for r in items]
                 if new_sid_order != current_sid_order:
                     sid_to_item = {
@@ -1820,6 +1910,7 @@ elif phase == "done":
                 "filenames": [],
                 "all_order_items": [], "order_records": [],
                 "result_bytes": None, "write_results": [],
+                "_order_visited_once": False,
                 "phase": "upload",
             })
             st.rerun()
