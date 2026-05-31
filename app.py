@@ -980,11 +980,13 @@ if phase == "upload":
                         pass
 
                 # 表示用画像 + Excel貼付用画像 + 補足資料を構築
+                # Excel領収書スロットは260x340pxなので、貼付用も最大1200pxで十分
+                # （Streamlit Cloud 1GB RAM制限内に収めるため極力小さく持つ）
                 if ext == '.pdf':
                     try:
-                        # zoom=1.5 で十分（Excel貼付・表示両用、メモリ節約）
+                        # zoom=1.2 で十分（Excel貼付・表示両用、メモリ節約）
                         _all_pages = pdf_to_image_bytes_all_pages(
-                            tmp_path, zoom=1.5
+                            tmp_path, zoom=1.2
                         )
                         _rot_applied = int(data.get("_orient_deg") or 0)
                         if _rot_applied:
@@ -1001,28 +1003,44 @@ if phase == "upload":
                         disp_img = _shrink_image_bytes(
                             get_display_image(tmp_path, ext)
                         )
-                    # Excel貼付用（メイン画像 = 1ページ目）
+                    # Excel貼付用: 1ページ目を更に小さくJPEG化
                     if _all_pages and _all_pages[0]:
-                        xl_img = _all_pages[0]
+                        xl_img = _shrink_image_bytes(
+                            _all_pages[0], max_w=1200, max_h=1600, quality=70
+                        )
                     else:
-                        xl_img = pdf_to_image_bytes(tmp_path, zoom=1.5)
-                    # 2ページ目以降は「PDFの追加ページ」として保持
-                    # （表示は連結画像で完結。Excel書き込み時にも同じNoで貼られる）
+                        xl_img = _shrink_image_bytes(
+                            pdf_to_image_bytes(tmp_path, zoom=1.2),
+                            max_w=1200, max_h=1600, quality=70,
+                        )
+                    # 2ページ目以降も縮小して保持（メモリ削減）
                     if len(_all_pages) > 1:
                         data["_pdf_extra_pages"] = [
-                            _pb for _pb in _all_pages[1:] if _pb
+                            _shrink_image_bytes(_pb, max_w=1200,
+                                                max_h=1600, quality=70)
+                            for _pb in _all_pages[1:] if _pb
                         ]
                 else:
-                    # 写真は session_state 肥大化を避けるため表示用は縮小して保持
+                    # 写真は session_state 肥大化を避けるため両方とも縮小して保持
                     disp_img = _shrink_image_bytes(
                         get_display_image(tmp_path, ext)
                     )
-                    xl_img = image_to_jpeg_bytes(tmp_path)
+                    xl_img = _shrink_image_bytes(
+                        image_to_jpeg_bytes(tmp_path),
+                        max_w=1200, max_h=1600, quality=70,
+                    )
+                # 大きな中間オブジェクトを早めに解放
+                _all_pages = None
                 images.append(disp_img)
                 excel_images.append(xl_img)
 
             finally:
                 os.unlink(tmp_path)
+
+            # 定期的にGCを呼んで不要オブジェクトを回収（大量枚数対策）
+            if (i + 1) % 5 == 0:
+                import gc as _gc
+                _gc.collect()
 
             # 進捗だけ更新（マスコットアニメは触らず連続再生）
             if receipt_files:
