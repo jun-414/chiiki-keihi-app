@@ -1263,12 +1263,18 @@ elif phase == "review":
                     st.session_state["_review_page"] = _page + 1
                     st.rerun()
             with _pcol3:
+                # キーに現在ページ番号を含めることで、prev/next ボタンや
+                # form_submit でページ番号が変わったときに別ウィジェットとして
+                # 再マウントされ、index= が正しく適用される。これがないと
+                # ドロップダウンが古い値を保持し、誤って _review_page を上書き
+                # してしまう（=「次へ」ボタンが反応しない／確定で1ページ目に戻る
+                # 不具合の原因になっていた）。
                 _jump = st.selectbox(
                     "ページへ移動",
                     list(range(1, _total_pages + 1)),
                     index=_page,
                     format_func=lambda x: f"P.{x}",
-                    key="page_jump_top",
+                    key=f"page_jump_top_p{_page}_n{_total_pages}",
                     label_visibility="collapsed",
                 )
                 if _jump - 1 != _page:
