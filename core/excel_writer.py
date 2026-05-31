@@ -462,7 +462,14 @@ def extract_receipt_sheet_images(ws_receipt) -> dict:
                     data = ref.read()
                 elif hasattr(ref, "getvalue"):
                     data = ref.getvalue()
-            if not data:
+            if not data or len(data) < 100:
+                continue
+            # PIL で開けない不正な画像は捨てる（再配置時にxlsx破損の原因になる）
+            try:
+                from PIL import Image as _PIL
+                import io as _io2
+                _PIL.open(_io2.BytesIO(data)).verify()
+            except Exception:
                 continue
 
             # アンカー位置 → (row, col) (1-based)
@@ -548,11 +555,46 @@ def add_receipt_images_to_sheet(ws, images: list):
     # 既存スロット数を取得して続きから配置
     existing_count = _count_existing_image_slots(ws)
 
-    for i, (no, img_bytes) in enumerate(images):
-        if not img_bytes:
+    # ===== 画像の検証＆正規化（破損xlsxを防ぐ） =====
+    def _clean_image(b):
+        """画像バイトを検証して正規化されたJPEGバイトと寸法を返す。失敗時(None, 0, 0)。"""
+        if not b or len(b) < 100:
+            return None, 0, 0
+        try:
+            from PIL import Image as PILImage
+            import io as _io
+            # 1) verify でフォーマット妥当性チェック（壊れ画像を弾く）
+            try:
+                PILImage.open(_io.BytesIO(b)).verify()
+            except Exception:
+                return None, 0, 0
+            # 2) 再オープン（verify後は再利用不可なので開き直し）
+            pil = PILImage.open(_io.BytesIO(b))
+            w, h = pil.size
+            if w < 1 or h < 1:
+                return None, 0, 0
+            # 3) RGB に統一
+            if pil.mode != 'RGB':
+                pil = pil.convert('RGB')
+            # 4) JPEGで再エンコード（Excelで確実に開ける形式に固定）
+            out_buf = _io.BytesIO()
+            pil.save(out_buf, format="JPEG", quality=85, optimize=True)
+            clean = out_buf.getvalue()
+            if len(clean) < 100:
+                return None, 0, 0
+            return clean, w, h
+        except Exception:
+            return None, 0, 0
+
+    # 「実際に描画される画像」だけスロットに置く（スキップ時にレイアウトが詰まる）
+    valid_idx = 0
+    for no, raw_bytes in images:
+        clean_bytes, orig_w, orig_h = _clean_image(raw_bytes)
+        if clean_bytes is None:
+            # 不正な画像はスキップ（xlsx破損防止）
             continue
 
-        slot_idx  = existing_count + i
+        slot_idx  = existing_count + valid_idx
         row_group = slot_idx // 2    # 何段目か（0始まり）
         col_side  = slot_idx % 2     # 0=左, 1=右
 
@@ -564,36 +606,25 @@ def add_receipt_images_to_sheet(ws, images: list):
         # No.ラベルを書き込む
         ws.cell(row=label_row, column=label_col, value=f"No.{no}")
 
-        # 画像をJPEGに変換 + 元のサイズ取得
-        orig_w, orig_h = None, None
-        try:
-            from PIL import Image as PILImage
-            import io as _io
-            pil_img = PILImage.open(_io.BytesIO(img_bytes))
-            orig_w, orig_h = pil_img.size
-            if pil_img.mode in ('RGBA', 'P', 'LA'):
-                pil_img = pil_img.convert('RGB')
-            buf = _io.BytesIO()
-            pil_img.save(buf, format="JPEG", quality=85)
-            img_bytes = buf.getvalue()
-        except Exception:
-            pass
-
         # 画像を貼り付け（元の縦横比を維持してスロットにフィット）
         try:
-            img = XLImage(BytesIO(img_bytes))
-            # PIL でサイズが取れなかった場合は openpyxl が読んだサイズを使う
-            if orig_w is None or orig_h is None:
-                orig_w = getattr(img, "width",  None) or MAX_WIDTH
-                orig_h = getattr(img, "height", None) or MAX_HEIGHT
+            img = XLImage(BytesIO(clean_bytes))
             # 縦横比を保ったままMAX_WIDTH×MAX_HEIGHTの中に収める
             scale = min(MAX_WIDTH / orig_w, MAX_HEIGHT / orig_h)
-            img.width  = int(orig_w * scale)
-            img.height = int(orig_h * scale)
+            new_w = max(1, int(orig_w * scale))
+            new_h = max(1, int(orig_h * scale))
+            img.width  = new_w
+            img.height = new_h
             img.anchor = f"{col_letter}{image_row}"
             ws.add_image(img)
+            valid_idx += 1
         except Exception:
-            pass
+            # 万一add_imageが失敗してもxlsx全体は壊さない
+            # ラベルだけ残ってしまうのを避けるためラベルもクリア
+            try:
+                ws.cell(row=label_row, column=label_col, value=None)
+            except Exception:
+                pass
 
 
 def clear_data_rows(ws):
