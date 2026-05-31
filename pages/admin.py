@@ -83,6 +83,47 @@ with st.sidebar:
     st.page_link("app.py", label="メイン画面に戻る", icon="🏠")
 
 
+# =========================================================
+# 🧪 AI読み取り切替バナー（タブの上に置いて、誰でも即見える/切替できる）
+# =========================================================
+_ai_now_setting = (get_setting("ai_enabled", "1") or "1").strip().lower()
+_ai_currently_on = _ai_now_setting not in ("0", "false", "off", "no")
+
+if _ai_currently_on:
+    _bg, _border, _color = "#e7f4ec", "#aedab9", "#1c5b34"
+    _icon, _title = "🤖", "AI読み取り：有効（通常モード）"
+    _msg = "Vision AIで領収書を解析しています。1枚あたり数秒・少額のAPI料金が発生します。"
+    _btn_label = "🧪 テストモードに切替（API停止 → OCRのみ）"
+    _btn_type = "secondary"
+else:
+    _bg, _border, _color = "#fff6e8", "#e8d4a8", "#8a5a17"
+    _icon, _title = "🧪", "テストモード中：API停止（OCRのみで読み取り）"
+    _msg = ("Vision AIへの問い合わせを行いません。tesseract OCR＋ルールベースで動作します。"
+            "精度は下がりますが、大量枚数の動作確認に最適です（API料金 0円）。")
+    _btn_label = "🤖 通常モードに戻す（AI再開）"
+    _btn_type = "primary"
+
+with st.container(border=True):
+    _cc1, _cc2 = st.columns([3, 1.4])
+    with _cc1:
+        st.markdown(
+            f"<div style='background:{_bg};border:1px solid {_border};"
+            f"border-radius:10px;padding:10px 16px;'>"
+            f"<div style='font-size:1.05rem;font-weight:700;color:{_color};'>"
+            f"{_icon} {_title}</div>"
+            f"<div style='color:{_color};font-size:0.86rem;opacity:0.88;"
+            f"margin-top:4px;line-height:1.5;'>{_msg}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with _cc2:
+        st.write("")
+        if st.button(_btn_label, type=_btn_type,
+                     use_container_width=True, key="quick_ai_toggle"):
+            set_setting("ai_enabled", "0" if _ai_currently_on else "1")
+            st.rerun()
+
+
 tab_usage, tab_api, tab_users, tab_settings = st.tabs(
     ["📊 利用状況", "🔑 API設定", "👥 ユーザー管理", "⚙️ 詳細設定"]
 )

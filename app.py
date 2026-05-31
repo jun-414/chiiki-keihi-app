@@ -672,6 +672,14 @@ with st.sidebar:
     st.divider()
     if ai_api_key:
         st.caption(f"🤖 AI読み取り: 有効（{ai_provider}）")
+    elif _ai_enabled_setting in ("0", "false", "off", "no"):
+        st.markdown(
+            "<div style='background:#fff6e8;border:1px solid #e8d4a8;"
+            "color:#8a5a17;padding:6px 10px;border-radius:8px;"
+            "font-size:0.8rem;font-weight:600;'>"
+            "🧪 テストモード中（OCRのみ・API停止）</div>",
+            unsafe_allow_html=True,
+        )
     else:
         st.caption("🤖 AI読み取り: 未設定")
     try:
